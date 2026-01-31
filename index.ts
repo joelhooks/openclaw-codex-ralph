@@ -10,8 +10,9 @@
 import type { MoltbotPluginApi } from "clawdbot/plugin-sdk";
 import { emitDiagnosticEvent } from "clawdbot/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join, resolve } from "path";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
+import { join, resolve, basename } from "path";
+import { homedir } from "os";
 
 // ============================================================================
 // Types
@@ -45,6 +46,7 @@ interface IterationResult {
   storyTitle: string;
   validationPassed: boolean;
   commitHash?: string;
+  sessionId?: string;
   error?: string;
   codexOutput?: string;
   codexFinalMessage?: string;
@@ -53,6 +55,41 @@ interface IterationResult {
   duration: number;
 }
 
+// ============================================================================
+// Orchestration Constants (from codex-orchestration skill)
+// ============================================================================
+
+const WORKER_PREAMBLE = `CONTEXT: WORKER
+ROLE: You are a sub-agent run by the ORCHESTRATOR. Do only the assigned task.
+RULES: No extra scope, no other workers.
+Your final output will be provided back to the ORCHESTRATOR.`;
+
+const ORCHESTRATION_PATTERNS = {
+  "triangulated-review": {
+    name: "Triangulated Review",
+    description: "Fan-out 2-4 reviewers with different lenses, then merge findings",
+    lenses: ["clarity/structure", "correctness/completeness", "risks/failure modes", "consistency/style"],
+  },
+  "review-fix": {
+    name: "Review → Fix",
+    description: "Serial chain: reviewer → implementer → verifier",
+    steps: ["Review and rank issues", "Implement top fixes", "Verify changes"],
+  },
+  "scout-act-verify": {
+    name: "Scout → Act → Verify",
+    description: "Gather context first, then execute, then validate",
+    steps: ["Scout gathers context", "Orchestrator chooses approach", "Implementer executes", "Verifier checks"],
+  },
+  "split-sections": {
+    name: "Split by Sections",
+    description: "Parallel work on distinct slices, merge for consistency",
+  },
+  "options-sprint": {
+    name: "Options Sprint",
+    description: "Generate 2-3 good alternatives, select and refine one",
+  },
+} as const;
+
 interface LoopResult {
   success: boolean;
   iterationsRun: number;
@@ -60,6 +97,39 @@ interface LoopResult {
   remainingStories: number;
   results: IterationResult[];
   stoppedReason: "complete" | "limit" | "failure" | "error";
+}
+
+// ============================================================================
+// Session Types (codexmonitor port)
+// ============================================================================
+
+interface SessionMeta {
+  id: string;
+  timestamp: string;
+  cwd: string;
+  model_provider?: string;
+  cli_version?: string;
+}
+
+interface SessionEvent {
+  timestamp: string;
+  type: string;
+  payload?: {
+    type?: string;
+    role?: string;
+    content?: Array<{ type: string; text?: string }>;
+    id?: string;
+    [key: string]: unknown;
+  };
+}
+
+interface SessionInfo {
+  id: string;
+  file: string;
+  timestamp: string;
+  cwd: string;
+  model?: string;
+  messageCount: number;
 }
 
 // ============================================================================
@@ -132,6 +202,165 @@ function getNextStory(prd: PRD): Story | null {
     .filter((s) => !s.passes)
     .sort((a, b) => a.priority - b.priority);
   return pending[0] ?? null;
+}
+
+// ============================================================================
+// Session Helpers (codexmonitor port)
+// ============================================================================
+
+function getCodexSessionsDir(): string {
+  return join(homedir(), ".codex", "sessions");
+}
+
+function listSessionDates(limit = 7): string[] {
+  const sessionsDir = getCodexSessionsDir();
+  if (!existsSync(sessionsDir)) return [];
+
+  const dates: string[] = [];
+  try {
+    const years = readdirSync(sessionsDir).filter((f) => /^\d{4}$/.test(f)).sort().reverse();
+    for (const year of years) {
+      const yearDir = join(sessionsDir, year);
+      const months = readdirSync(yearDir).filter((f) => /^\d{2}$/.test(f)).sort().reverse();
+      for (const month of months) {
+        const monthDir = join(yearDir, month);
+        const days = readdirSync(monthDir).filter((f) => /^\d{2}$/.test(f)).sort().reverse();
+        for (const day of days) {
+          dates.push(`${year}/${month}/${day}`);
+          if (dates.length >= limit) return dates;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return dates;
+}
+
+function listSessions(date?: string, limit = 20): SessionInfo[] {
+  const sessionsDir = getCodexSessionsDir();
+  if (!existsSync(sessionsDir)) return [];
+
+  const sessions: SessionInfo[] = [];
+  const dates = date ? [date] : listSessionDates(7);
+
+  for (const d of dates) {
+    const dayDir = join(sessionsDir, d);
+    if (!existsSync(dayDir)) continue;
+
+    try {
+      const files = readdirSync(dayDir).filter((f) => f.endsWith(".jsonl")).sort().reverse();
+      for (const file of files) {
+        if (sessions.length >= limit) break;
+        const filePath = join(dayDir, file);
+        const info = parseSessionFile(filePath);
+        if (info) sessions.push(info);
+      }
+    } catch {
+      // ignore
+    }
+    if (sessions.length >= limit) break;
+  }
+
+  return sessions;
+}
+
+function parseSessionFile(filePath: string): SessionInfo | null {
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const lines = content.split("\n").filter((l) => l.trim());
+    if (lines.length === 0) return null;
+
+    let meta: SessionMeta | null = null;
+    let messageCount = 0;
+
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line) as SessionEvent;
+        if (event.type === "session_meta" && event.payload) {
+          meta = event.payload as unknown as SessionMeta;
+        }
+        if (event.type === "response_item" && event.payload?.role === "user") {
+          messageCount++;
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+
+    if (!meta) return null;
+
+    return {
+      id: meta.id,
+      file: filePath,
+      timestamp: meta.timestamp,
+      cwd: meta.cwd,
+      model: meta.model_provider,
+      messageCount,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getSessionById(sessionId: string): { info: SessionInfo; events: SessionEvent[] } | null {
+  const sessions = listSessions(undefined, 100);
+  const session = sessions.find((s) => s.id === sessionId || s.id.startsWith(sessionId));
+  if (!session) return null;
+
+  try {
+    const content = readFileSync(session.file, "utf-8");
+    const events: SessionEvent[] = [];
+    for (const line of content.split("\n").filter((l) => l.trim())) {
+      try {
+        events.push(JSON.parse(line) as SessionEvent);
+      } catch {
+        // skip
+      }
+    }
+    return { info: session, events };
+  } catch {
+    return null;
+  }
+}
+
+function extractSessionMessages(events: SessionEvent[], ranges?: string): Array<{ role: string; content: string; index: number }> {
+  const messages: Array<{ role: string; content: string; index: number }> = [];
+  let index = 0;
+
+  for (const event of events) {
+    if (event.type === "response_item" && event.payload?.content) {
+      const role = event.payload.role || "unknown";
+      const contentParts = event.payload.content;
+      const text = contentParts
+        .filter((c) => c.type === "input_text" || c.type === "output_text")
+        .map((c) => c.text || "")
+        .join("\n");
+      if (text.trim()) {
+        messages.push({ role, content: text.slice(0, 2000), index });
+        index++;
+      }
+    }
+  }
+
+  if (ranges) {
+    // Parse ranges like "1...3,5...7"
+    const rangeSet = new Set<number>();
+    for (const part of ranges.split(",")) {
+      const match = part.match(/(\d+)\.\.\.(\d+)/);
+      if (match && match[1] && match[2]) {
+        const start = parseInt(match[1], 10);
+        const end = parseInt(match[2], 10);
+        for (let i = start; i <= end; i++) rangeSet.add(i);
+      } else {
+        const num = parseInt(part.trim(), 10);
+        if (!isNaN(num)) rangeSet.add(num);
+      }
+    }
+    return messages.filter((m) => rangeSet.has(m.index));
+  }
+
+  return messages;
 }
 
 function runValidation(workdir: string, command?: string): { success: boolean; output: string } {
@@ -226,6 +455,7 @@ interface CodexIterationResult {
   events: CodexEvent[];
   toolCalls: number;
   filesModified: string[];
+  sessionId?: string;
 }
 
 async function runCodexIteration(
@@ -286,8 +516,14 @@ async function runCodexIteration(
       // Extract useful info from events
       const toolCalls = events.filter((e) => e.type === "tool_call" || e.type === "function_call").length;
       const filesModified: string[] = [];
+      let sessionId: string | undefined;
 
       for (const event of events) {
+        // Extract session ID from session_start or similar events
+        if (event.type === "session_start" || event.type === "session_meta") {
+          const payload = event as unknown as { session_id?: string; id?: string; payload?: { id?: string } };
+          sessionId = payload.session_id || payload.id || payload.payload?.id;
+        }
         if (event.type === "tool_call" && event.tool === "write_file" && event.args?.path) {
           filesModified.push(String(event.args.path));
         }
@@ -317,6 +553,7 @@ async function runCodexIteration(
         events,
         toolCalls,
         filesModified: [...new Set(filesModified)],
+        sessionId,
       });
     });
 
@@ -328,6 +565,7 @@ async function runCodexIteration(
         events: [],
         toolCalls: 0,
         filesModified: [],
+        sessionId: undefined,
       });
     });
 
@@ -884,7 +1122,203 @@ const ralphCodexPlugin = {
       },
     });
 
-    console.log(`[ralph-codex] Registered 6 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
+    // ========================================================================
+    // Session Tools (codexmonitor port)
+    // ========================================================================
+
+    // ralph_sessions - list recent codex sessions
+    api.registerTool({
+      name: "ralph_sessions",
+      label: "Ralph Sessions",
+      description: "List recent Codex sessions from ~/.codex/sessions. Like codexmonitor list.",
+      parameters: {
+        type: "object",
+        properties: {
+          date: { type: "string", description: "Date filter (YYYY/MM/DD)" },
+          limit: { type: "number", description: "Max sessions to return (default: 20)" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const sessions = listSessions(params.date as string | undefined, (params.limit as number) || 20);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              count: sessions.length,
+              sessions: sessions.map((s) => ({
+                id: s.id,
+                timestamp: s.timestamp,
+                cwd: s.cwd,
+                model: s.model,
+                messages: s.messageCount,
+              })),
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    // ralph_session_show - show a specific session
+    api.registerTool({
+      name: "ralph_session_show",
+      label: "Ralph Session Show",
+      description: "Show details of a specific Codex session. Like codexmonitor show.",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Session ID (full or prefix)" },
+          ranges: { type: "string", description: "Message ranges to show (e.g., '1...3,5...7')" },
+        },
+        required: ["sessionId"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const session = getSessionById(params.sessionId as string);
+        if (!session) {
+          return { content: [{ type: "text", text: JSON.stringify({ error: "Session not found" }) }] };
+        }
+        const messages = extractSessionMessages(session.events, params.ranges as string | undefined);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              info: session.info,
+              messageCount: messages.length,
+              messages: messages.slice(0, 50), // Limit to avoid huge output
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    // ralph_session_resume - resume a codex session
+    api.registerTool({
+      name: "ralph_session_resume",
+      label: "Ralph Session Resume",
+      description: "Resume a previous Codex session with a new message.",
+      parameters: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Session ID to resume" },
+          message: { type: "string", description: "Message to continue with" },
+        },
+        required: ["sessionId", "message"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const sessionId = params.sessionId as string;
+        const message = params.message as string;
+
+        try {
+          const output = execSync(
+            `codex exec resume ${sessionId} "${message.replace(/"/g, '\\"')}"`,
+            { encoding: "utf-8", timeout: 300000 }
+          );
+          return { content: [{ type: "text", text: output.slice(0, 5000) }] };
+        } catch (error) {
+          const err = error as { message?: string; stdout?: string };
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({ error: err.message, output: err.stdout?.slice(0, 2000) }),
+            }],
+          };
+        }
+      },
+    });
+
+    // ralph_patterns - show orchestration patterns
+    api.registerTool({
+      name: "ralph_patterns",
+      label: "Ralph Patterns",
+      description: "Show available orchestration patterns for task decomposition (from codex-orchestration skill).",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Specific pattern to show details for" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const patternName = params.pattern as string | undefined;
+        if (patternName && ORCHESTRATION_PATTERNS[patternName as keyof typeof ORCHESTRATION_PATTERNS]) {
+          const p = ORCHESTRATION_PATTERNS[patternName as keyof typeof ORCHESTRATION_PATTERNS];
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                pattern: patternName,
+                ...p,
+                workerPreamble: WORKER_PREAMBLE,
+              }, null, 2),
+            }],
+          };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              patterns: Object.entries(ORCHESTRATION_PATTERNS).map(([key, val]) => ({
+                id: key,
+                name: val.name,
+                description: val.description,
+              })),
+              workerPreamble: WORKER_PREAMBLE,
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    // ralph_worker_prompt - generate a worker prompt
+    api.registerTool({
+      name: "ralph_worker_prompt",
+      label: "Ralph Worker Prompt",
+      description: "Generate a worker prompt with the standard preamble for spawning a codex sub-agent.",
+      parameters: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "Task description for the worker" },
+          role: { type: "string", description: "Worker role: reviewer, implementer, verifier, research" },
+          scope: { type: "string", description: "Scope constraint: read-only or specific files" },
+          lens: { type: "string", description: "Review lens (for reviewer role)" },
+          workdir: { type: "string", description: "Working directory" },
+        },
+        required: ["task"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const task = params.task as string;
+        const role = (params.role as string) || "implementer";
+        const scope = (params.scope as string) || "read-only";
+        const lens = params.lens as string | undefined;
+        const workdir = params.workdir as string | undefined;
+
+        let prompt = WORKER_PREAMBLE + "\n";
+        prompt += `TASK: ${task}\n`;
+        prompt += `SCOPE: ${scope}\n`;
+        if (lens) prompt += `LENS: ${lens}\n`;
+
+        // Build the codex command
+        const cmdParts = ["codex", "exec", "--full-auto", "--output-last-message", "/tmp/worker-output.txt"];
+        if (workdir) cmdParts.push("-C", workdir);
+        cmdParts.push(`"${prompt.replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`);
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              prompt,
+              command: cmdParts.join(" "),
+              outputFile: "/tmp/worker-output.txt",
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    console.log(`[openclaw-codex-ralph] Registered 11 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
   },
 };
 
