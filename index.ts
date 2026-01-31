@@ -97,7 +97,52 @@ interface LoopResult {
   storiesCompleted: number;
   remainingStories: number;
   results: IterationResult[];
-  stoppedReason: "complete" | "limit" | "failure" | "error";
+  stoppedReason: "complete" | "limit" | "failure" | "error" | "cancelled";
+}
+
+// ============================================================================
+// Job Store for Async Loops
+// ============================================================================
+
+interface LoopJob {
+  id: string;
+  workdir: string;
+  status: "running" | "completed" | "failed" | "cancelled";
+  startedAt: number;
+  completedAt?: number;
+  currentIteration: number;
+  maxIterations: number;
+  currentStory?: { id: string; title: string };
+  storiesCompleted: number;
+  totalStories: number;
+  results: IterationResult[];
+  error?: string;
+  abortController?: AbortController;
+}
+
+const activeJobs = new Map<string, LoopJob>();
+
+function generateJobId(): string {
+  return `ralph-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function emitLoopProgress(job: LoopJob, event: "start" | "iteration" | "complete" | "error") {
+  emitDiagnosticEvent({
+    type: `ralph:loop:${event}`,
+    plugin: "openclaw-codex-ralph",
+    data: {
+      jobId: job.id,
+      workdir: job.workdir,
+      status: job.status,
+      iteration: job.currentIteration,
+      maxIterations: job.maxIterations,
+      currentStory: job.currentStory,
+      storiesCompleted: job.storiesCompleted,
+      totalStories: job.totalStories,
+      elapsedMs: Date.now() - job.startedAt,
+      error: job.error,
+    },
+  });
 }
 
 // ============================================================================
@@ -825,7 +870,8 @@ async function executeRalphIterate(
   return result;
 }
 
-async function executeRalphLoop(
+// Legacy synchronous loop (kept for backward compatibility with ralph_iterate)
+async function executeRalphLoopSync(
   params: { workdir: string; maxIterations?: number; model?: string; stopOnFailure?: boolean },
   cfg: PluginConfig
 ): Promise<LoopResult> {
@@ -860,19 +906,6 @@ async function executeRalphLoop(
     }
 
     loopResult.iterationsRun++;
-
-    // Emit progress event - starting iteration
-    emitDiagnosticEvent({
-      type: "ralph:iteration:start",
-      plugin: "openclaw-codex-ralph",
-      data: {
-        iteration: loopResult.iterationsRun,
-        maxIterations,
-        storyId: story.id,
-        storyTitle: story.title,
-        workdir,
-      },
-    });
 
     const progress = readProgress(workdir);
     const agentsMd = readAgentsMd(workdir);
@@ -929,24 +962,6 @@ async function executeRalphLoop(
     }
 
     loopResult.results.push(iterResult);
-
-    // Emit progress event - iteration complete
-    emitDiagnosticEvent({
-      type: "ralph:iteration:complete",
-      plugin: "openclaw-codex-ralph",
-      data: {
-        iteration: loopResult.iterationsRun,
-        maxIterations,
-        storyId: story.id,
-        storyTitle: story.title,
-        success: iterResult.success,
-        toolCalls: iterResult.toolCalls,
-        filesModified: iterResult.filesModified,
-        duration: iterResult.duration,
-        storiesCompleted: loopResult.storiesCompleted,
-        workdir,
-      },
-    });
   }
 
   // Final status
@@ -963,6 +978,168 @@ async function executeRalphLoop(
   }
 
   return loopResult;
+}
+
+// Async job-based loop - returns immediately, runs in background
+async function executeRalphLoopAsync(
+  job: LoopJob,
+  params: { stopOnFailure?: boolean },
+  cfg: PluginConfig
+): Promise<void> {
+  const workdir = job.workdir;
+  const maxIterations = job.maxIterations;
+  const stopOnFailure = params.stopOnFailure;
+
+  const loopCfg = { ...cfg };
+
+  emitLoopProgress(job, "start");
+
+  try {
+    for (let i = 0; i < maxIterations; i++) {
+      // Check for cancellation
+      if (job.status === "cancelled") {
+        emitLoopProgress(job, "complete");
+        return;
+      }
+
+      const prd = readPRD(workdir);
+      if (!prd) {
+        job.status = "failed";
+        job.error = "Failed to read prd.json";
+        job.completedAt = Date.now();
+        emitLoopProgress(job, "error");
+        return;
+      }
+
+      job.totalStories = prd.stories.length;
+      const story = getNextStory(prd);
+      if (!story) {
+        job.status = "completed";
+        job.completedAt = Date.now();
+        emitLoopProgress(job, "complete");
+        return;
+      }
+
+      job.currentIteration = i + 1;
+      job.currentStory = { id: story.id, title: story.title };
+      emitLoopProgress(job, "iteration");
+
+      const progress = readProgress(workdir);
+      const agentsMd = readAgentsMd(workdir);
+      const prompt = buildIterationPrompt(prd, story, progress, agentsMd);
+
+      const startTime = Date.now();
+      const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
+      const validation = runValidation(workdir, story.validationCommand);
+
+      const iterResult: IterationResult = {
+        success: codexResult.success && validation.success,
+        storyId: story.id,
+        storyTitle: story.title,
+        validationPassed: validation.success,
+        codexOutput: codexResult.output.slice(0, 500),
+        codexFinalMessage: codexResult.finalMessage.slice(0, 500),
+        toolCalls: codexResult.toolCalls,
+        filesModified: codexResult.filesModified,
+        duration: Date.now() - startTime,
+      };
+
+      job.results.push(iterResult);
+
+      if (iterResult.success) {
+        story.passes = true;
+        prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+        prd.metadata.lastIteration = new Date().toISOString();
+        prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
+        writePRD(workdir, prd);
+        job.storiesCompleted++;
+
+        const progressEntry = [
+          `Completed: ${story.title}`,
+          `Files: ${codexResult.filesModified.join(", ") || "none"}`,
+          `Summary: ${codexResult.finalMessage.slice(0, 400)}`,
+        ].join("\n");
+        appendProgress(workdir, progressEntry);
+
+        if (cfg.autoCommit) {
+          const hash = gitCommit(workdir, `ralph: ${story.title}`);
+          iterResult.commitHash = hash || undefined;
+        }
+
+        emitLoopProgress(job, "iteration");
+      } else {
+        const failEntry = [
+          `Failed: ${story.title}`,
+          `Validation: ${validation.output.slice(0, 300)}`,
+          `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
+        ].join("\n");
+        appendProgress(workdir, failEntry);
+
+        if (stopOnFailure) {
+          job.status = "failed";
+          job.error = `Story failed: ${story.title}`;
+          job.completedAt = Date.now();
+          emitLoopProgress(job, "error");
+          return;
+        }
+
+        emitLoopProgress(job, "iteration");
+      }
+    }
+
+    // Reached max iterations
+    const finalPrd = readPRD(workdir);
+    const remaining = finalPrd ? finalPrd.stories.filter((s) => !s.passes).length : 0;
+    
+    if (remaining === 0) {
+      job.status = "completed";
+    } else {
+      job.status = "completed";
+      job.error = `Max iterations reached with ${remaining} stories remaining`;
+    }
+    job.completedAt = Date.now();
+    emitLoopProgress(job, "complete");
+
+  } catch (err) {
+    job.status = "failed";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.completedAt = Date.now();
+    emitLoopProgress(job, "error");
+  }
+}
+
+// Start a loop job in the background - returns immediately
+function startLoopJob(
+  params: { workdir: string; maxIterations?: number; model?: string; stopOnFailure?: boolean },
+  cfg: PluginConfig
+): LoopJob {
+  const prd = readPRD(params.workdir);
+  const totalStories = prd ? prd.stories.length : 0;
+  const pendingStories = prd ? prd.stories.filter((s) => !s.passes).length : 0;
+
+  const job: LoopJob = {
+    id: generateJobId(),
+    workdir: params.workdir,
+    status: "running",
+    startedAt: Date.now(),
+    currentIteration: 0,
+    maxIterations: params.maxIterations || cfg.maxIterations,
+    storiesCompleted: 0,
+    totalStories,
+    results: [],
+  };
+
+  activeJobs.set(job.id, job);
+
+  // Start the loop in the background (fire and forget)
+  executeRalphLoopAsync(job, { stopOnFailure: params.stopOnFailure }, { ...cfg, model: params.model || cfg.model })
+    .catch((err) => {
+      job.status = "failed";
+      job.error = err instanceof Error ? err.message : String(err);
+      job.completedAt = Date.now();
+    });
+
+  return job;
 }
 
 // ============================================================================
@@ -1101,11 +1278,11 @@ const ralphCodexPlugin = {
       },
     });
 
-    // ralph_loop
+    // ralph_loop - NOW ASYNC! Returns job ID immediately
     api.registerTool({
       name: "ralph_loop",
-      label: "Ralph Loop",
-      description: "Run the full Ralph loop until all stories pass or max iterations reached.",
+      label: "Ralph Loop (Async)",
+      description: "Start a Ralph loop in the background. Returns immediately with a job ID. Use ralph_loop_status to check progress.",
       parameters: {
         type: "object",
         properties: {
@@ -1113,13 +1290,138 @@ const ralphCodexPlugin = {
           maxIterations: { type: "number", description: "Max iterations (default: from config)" },
           model: { type: "string", description: "Override model for iterations" },
           stopOnFailure: { type: "boolean", description: "Stop loop on first failure (default: false)" },
+          sync: { type: "boolean", description: "Run synchronously (blocks until complete, legacy behavior)" },
         },
         required: ["workdir"],
         additionalProperties: false,
       },
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-        const result = await executeRalphLoop(params as Parameters<typeof executeRalphLoop>[0], cfg);
-        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        // Legacy sync mode for backward compat
+        if (params.sync) {
+          const result = await executeRalphLoopSync(params as Parameters<typeof executeRalphLoopSync>[0], cfg);
+          return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        }
+
+        // New async mode - returns immediately
+        const job = startLoopJob(params as Parameters<typeof startLoopJob>[0], cfg);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              jobId: job.id,
+              status: job.status,
+              workdir: job.workdir,
+              maxIterations: job.maxIterations,
+              totalStories: job.totalStories,
+              message: "Loop started in background. Use ralph_loop_status to check progress.",
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    // ralph_loop_status - check status of running/completed jobs
+    api.registerTool({
+      name: "ralph_loop_status",
+      label: "Ralph Loop Status",
+      description: "Check the status of a running or completed ralph loop job.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Job ID (optional - lists all if not provided)" },
+        },
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const jobId = params.jobId as string | undefined;
+        
+        if (jobId) {
+          const job = activeJobs.get(jobId);
+          if (!job) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: "Job not found", jobId }) }] };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                jobId: job.id,
+                status: job.status,
+                workdir: job.workdir,
+                currentIteration: job.currentIteration,
+                maxIterations: job.maxIterations,
+                currentStory: job.currentStory,
+                storiesCompleted: job.storiesCompleted,
+                totalStories: job.totalStories,
+                elapsedMs: Date.now() - job.startedAt,
+                completedAt: job.completedAt,
+                error: job.error,
+                results: job.results.map((r) => ({
+                  storyId: r.storyId,
+                  storyTitle: r.storyTitle,
+                  success: r.success,
+                  duration: r.duration,
+                  commitHash: r.commitHash,
+                })),
+              }, null, 2),
+            }],
+          };
+        }
+
+        // List all jobs
+        const jobs = Array.from(activeJobs.values()).map((j) => ({
+          jobId: j.id,
+          status: j.status,
+          workdir: j.workdir,
+          currentIteration: j.currentIteration,
+          maxIterations: j.maxIterations,
+          storiesCompleted: j.storiesCompleted,
+          totalStories: j.totalStories,
+          elapsedMs: Date.now() - j.startedAt,
+        }));
+        return { content: [{ type: "text", text: JSON.stringify({ jobs, count: jobs.length }, null, 2) }] };
+      },
+    });
+
+    // ralph_loop_cancel - cancel a running job
+    api.registerTool({
+      name: "ralph_loop_cancel",
+      label: "Ralph Loop Cancel",
+      description: "Cancel a running ralph loop job.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Job ID to cancel (required)" },
+        },
+        required: ["jobId"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const jobId = params.jobId as string;
+        const job = activeJobs.get(jobId);
+        
+        if (!job) {
+          return { content: [{ type: "text", text: JSON.stringify({ error: "Job not found", jobId }) }] };
+        }
+        
+        if (job.status !== "running") {
+          return { content: [{ type: "text", text: JSON.stringify({ error: "Job is not running", jobId, status: job.status }) }] };
+        }
+
+        job.status = "cancelled";
+        job.completedAt = Date.now();
+        emitLoopProgress(job, "complete");
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              jobId: job.id,
+              status: job.status,
+              message: "Job cancelled. Will stop after current iteration.",
+              storiesCompleted: job.storiesCompleted,
+            }, null, 2),
+          }],
+        };
       },
     });
 
