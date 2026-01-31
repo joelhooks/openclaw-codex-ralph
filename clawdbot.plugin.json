@@ -8,7 +8,7 @@
     "properties": {
       "model": {
         "type": "string",
-        "default": "gpt-5.2-codex",
+        "default": "o3",
         "description": "Model to use for codex iterations"
       },
       "maxIterations": {
