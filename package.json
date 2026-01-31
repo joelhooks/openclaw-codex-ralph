@@ -5,10 +5,14 @@
   "type": "module",
   "main": "index.ts",
   "moltbot": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "clawdbot": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "keywords": [
     "moltbot",
@@ -24,5 +28,10 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/joelhooks/openclaw-codex-ralph.git"
+  },
+  "devDependencies": {
+    "@total-typescript/tsconfig": "^1.0.4",
+    "@types/node": "^25.1.0",
+    "typescript": "^5.9.3"
   }
 }

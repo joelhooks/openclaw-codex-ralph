@@ -71,7 +71,7 @@ interface PluginConfig {
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
-  model: "o3",
+  model: "gpt-5.2-codex",
   maxIterations: 20,
   sandbox: "workspace-write",
   autoCommit: true,
@@ -127,7 +127,7 @@ function getNextStory(prd: PRD): Story | null {
   const pending = prd.stories
     .filter((s) => !s.passes)
     .sort((a, b) => a.priority - b.priority);
-  return pending.length > 0 ? pending[0] : null;
+  return pending[0] ?? null;
 }
 
 function runValidation(workdir: string, command?: string): { success: boolean; output: string } {
