@@ -37,4 +37,10 @@ declare module "clawdbot/plugin-sdk" {
     properties: Record<string, never>;
     additionalProperties: false;
   };
+
+  export function emitDiagnosticEvent(event: {
+    type: string;
+    plugin?: string;
+    data?: Record<string, unknown>;
+  }): void;
 }

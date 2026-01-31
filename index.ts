@@ -8,6 +8,7 @@
  * Based on: https://github.com/snarktank/ralph
  */
 import type { MoltbotPluginApi } from "clawdbot/plugin-sdk";
+import { emitDiagnosticEvent } from "clawdbot/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, resolve } from "path";
@@ -46,6 +47,9 @@ interface IterationResult {
   commitHash?: string;
   error?: string;
   codexOutput?: string;
+  codexFinalMessage?: string;
+  toolCalls?: number;
+  filesModified?: string[];
   duration: number;
 }
 
@@ -205,27 +209,51 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
   return parts.join("\n");
 }
 
+interface CodexEvent {
+  type: string;
+  message?: string;
+  content?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  output?: string;
+  error?: string;
+}
+
+interface CodexIterationResult {
+  success: boolean;
+  output: string;
+  finalMessage: string;
+  events: CodexEvent[];
+  toolCalls: number;
+  filesModified: string[];
+}
+
 async function runCodexIteration(
   workdir: string,
   prompt: string,
   cfg: PluginConfig
-): Promise<{ success: boolean; output: string }> {
+): Promise<CodexIterationResult> {
   return new Promise((resolve) => {
+    const resolvedWorkdir = resolvePath(workdir);
+    const outputFile = join(resolvedWorkdir, `.ralph-last-message-${Date.now()}.txt`);
+
     const args = [
       "exec",
       "--full-auto",
       "--sandbox", cfg.sandbox,
-      "-C", resolvePath(workdir),
+      "--json",
+      "-o", outputFile,
+      "-C", resolvedWorkdir,
       "-m", cfg.model,
       prompt,
     ];
 
     if (cfg.debug) {
-      console.log(`[ralph-codex] Running: codex ${args.join(" ").slice(0, 100)}...`);
+      console.log(`[openclaw-codex-ralph] Running: codex ${args.slice(0, 5).join(" ")}...`);
     }
 
     const child = spawn("codex", args, {
-      cwd: resolvePath(workdir),
+      cwd: resolvedWorkdir,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -233,26 +261,73 @@ async function runCodexIteration(
     let stdout = "";
     let stderr = "";
 
-    child.stdout?.on("data", (data) => {
+    child.stdout?.on("data", (data: Buffer) => {
       stdout += data.toString();
     });
 
-    child.stderr?.on("data", (data) => {
+    child.stderr?.on("data", (data: Buffer) => {
       stderr += data.toString();
     });
 
-    child.on("close", (code) => {
-      const output = stdout + (stderr ? `\n[stderr]: ${stderr}` : "");
+    child.on("close", (code: number | null) => {
+      // Parse JSONL events
+      const events: CodexEvent[] = [];
+      const lines = stdout.split("\n").filter((l) => l.trim());
+
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line) as CodexEvent;
+          events.push(event);
+        } catch {
+          // Not JSON, skip
+        }
+      }
+
+      // Extract useful info from events
+      const toolCalls = events.filter((e) => e.type === "tool_call" || e.type === "function_call").length;
+      const filesModified: string[] = [];
+
+      for (const event of events) {
+        if (event.type === "tool_call" && event.tool === "write_file" && event.args?.path) {
+          filesModified.push(String(event.args.path));
+        }
+        if (event.type === "tool_call" && event.tool === "edit_file" && event.args?.path) {
+          filesModified.push(String(event.args.path));
+        }
+      }
+
+      // Read final message from output file
+      let finalMessage = "";
+      try {
+        if (existsSync(outputFile)) {
+          finalMessage = readFileSync(outputFile, "utf-8");
+          // Clean up temp file
+          try { execSync(`rm "${outputFile}"`, { encoding: "utf-8" }); } catch { /* ignore */ }
+        }
+      } catch {
+        finalMessage = "";
+      }
+
+      const output = finalMessage || stdout.slice(0, 5000);
+
       resolve({
         success: code === 0,
         output,
+        finalMessage,
+        events,
+        toolCalls,
+        filesModified: [...new Set(filesModified)],
       });
     });
 
-    child.on("error", (err) => {
+    child.on("error", (err: Error) => {
       resolve({
         success: false,
         output: `Spawn error: ${err.message}`,
+        finalMessage: "",
+        events: [],
+        toolCalls: 0,
+        filesModified: [],
       });
     });
 
@@ -262,6 +337,10 @@ async function runCodexIteration(
       resolve({
         success: false,
         output: "Timeout: iteration exceeded 10 minutes",
+        finalMessage: "",
+        events: [],
+        toolCalls: 0,
+        filesModified: [],
       });
     }, 600000);
   });
@@ -462,6 +541,9 @@ async function executeRalphIterate(
     storyTitle: story.title,
     validationPassed: validation.success,
     codexOutput: codexResult.output.slice(0, 2000),
+    codexFinalMessage: codexResult.finalMessage.slice(0, 2000),
+    toolCalls: codexResult.toolCalls,
+    filesModified: codexResult.filesModified,
     duration: Date.now() - startTime,
   };
 
@@ -473,8 +555,15 @@ async function executeRalphIterate(
     prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
     writePRD(workdir, prd);
 
-    // Append to progress
-    appendProgress(workdir, `Completed: ${story.title}\nValidation: ${story.validationCommand || "default"}\nOutput summary: ${codexResult.output.slice(0, 500)}`);
+    // Append to progress with final message
+    const progressEntry = [
+      `Completed: ${story.title}`,
+      `Files modified: ${codexResult.filesModified.join(", ") || "none"}`,
+      `Tool calls: ${codexResult.toolCalls}`,
+      `Validation: ${story.validationCommand || "default"}`,
+      `Summary: ${codexResult.finalMessage.slice(0, 800)}`,
+    ].join("\n");
+    appendProgress(workdir, progressEntry);
 
     // Git commit
     if (cfg.autoCommit) {
@@ -482,8 +571,16 @@ async function executeRalphIterate(
       result.commitHash = hash || undefined;
     }
   } else {
-    // Log failure
-    appendProgress(workdir, `Failed: ${story.title}\nValidation output: ${validation.output.slice(0, 500)}\nCodex output: ${codexResult.output.slice(0, 500)}`);
+    // Log failure with details
+    const failureEntry = [
+      `Failed: ${story.title}`,
+      `Codex success: ${codexResult.success}`,
+      `Validation success: ${validation.success}`,
+      `Files touched: ${codexResult.filesModified.join(", ") || "none"}`,
+      `Validation output: ${validation.output.slice(0, 500)}`,
+      `Codex message: ${codexResult.finalMessage.slice(0, 500)}`,
+    ].join("\n");
+    appendProgress(workdir, failureEntry);
   }
 
   return result;
@@ -525,6 +622,19 @@ async function executeRalphLoop(
 
     loopResult.iterationsRun++;
 
+    // Emit progress event - starting iteration
+    emitDiagnosticEvent({
+      type: "ralph:iteration:start",
+      plugin: "openclaw-codex-ralph",
+      data: {
+        iteration: loopResult.iterationsRun,
+        maxIterations,
+        storyId: story.id,
+        storyTitle: story.title,
+        workdir,
+      },
+    });
+
     const progress = readProgress(workdir);
     const agentsMd = readAgentsMd(workdir);
     const prompt = buildIterationPrompt(prd, story, progress, agentsMd);
@@ -539,6 +649,9 @@ async function executeRalphLoop(
       storyTitle: story.title,
       validationPassed: validation.success,
       codexOutput: codexResult.output.slice(0, 500),
+      codexFinalMessage: codexResult.finalMessage.slice(0, 500),
+      toolCalls: codexResult.toolCalls,
+      filesModified: codexResult.filesModified,
       duration: Date.now() - startTime,
     };
 
@@ -550,14 +663,24 @@ async function executeRalphLoop(
       writePRD(workdir, prd);
       loopResult.storiesCompleted++;
 
-      appendProgress(workdir, `Completed: ${story.title}`);
+      const progressEntry = [
+        `Completed: ${story.title}`,
+        `Files: ${codexResult.filesModified.join(", ") || "none"}`,
+        `Summary: ${codexResult.finalMessage.slice(0, 400)}`,
+      ].join("\n");
+      appendProgress(workdir, progressEntry);
 
       if (cfg.autoCommit) {
         const hash = gitCommit(workdir, `ralph: ${story.title}`);
         iterResult.commitHash = hash || undefined;
       }
     } else {
-      appendProgress(workdir, `Failed: ${story.title}\n${validation.output.slice(0, 300)}`);
+      const failEntry = [
+        `Failed: ${story.title}`,
+        `Validation: ${validation.output.slice(0, 300)}`,
+        `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
+      ].join("\n");
+      appendProgress(workdir, failEntry);
 
       if (stopOnFailure) {
         loopResult.stoppedReason = "failure";
@@ -567,6 +690,24 @@ async function executeRalphLoop(
     }
 
     loopResult.results.push(iterResult);
+
+    // Emit progress event - iteration complete
+    emitDiagnosticEvent({
+      type: "ralph:iteration:complete",
+      plugin: "openclaw-codex-ralph",
+      data: {
+        iteration: loopResult.iterationsRun,
+        maxIterations,
+        storyId: story.id,
+        storyTitle: story.title,
+        success: iterResult.success,
+        toolCalls: iterResult.toolCalls,
+        filesModified: iterResult.filesModified,
+        duration: iterResult.duration,
+        storiesCompleted: loopResult.storiesCompleted,
+        workdir,
+      },
+    });
   }
 
   // Final status
