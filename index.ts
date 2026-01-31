@@ -13,6 +13,7 @@ import { execFileSync, execSync, spawn } from "child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
 import { join, resolve, basename } from "path";
 import { homedir } from "os";
+import { autopsyTools } from "./autopsy.js";
 
 // ============================================================================
 // Types
@@ -1318,7 +1319,250 @@ const ralphCodexPlugin = {
       },
     });
 
-    console.log(`[openclaw-codex-ralph] Registered 11 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
+    // ========================================================================
+    // Autopsy Tools (repo analysis)
+    // ========================================================================
+
+    api.registerTool({
+      name: "autopsy_clone",
+      label: "Autopsy Clone",
+      description: "Clone/update a GitHub repo locally for deep analysis. Returns local path.",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          refresh: { type: "boolean", description: "Force refresh even if cached" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.clone(p.repo as string, p.refresh as boolean) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_structure",
+      label: "Autopsy Structure",
+      description: "Get directory tree of cloned repo",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          path: { type: "string", description: "Subpath to explore" },
+          depth: { type: "number", description: "Max depth (default: 4)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.structure(p.repo as string, p.path as string, p.depth as number) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_search",
+      label: "Autopsy Search",
+      description: "Ripgrep search in cloned repo - full regex power",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          pattern: { type: "string", description: "Regex pattern" },
+          fileGlob: { type: "string", description: "File glob filter (e.g., '*.ts')" },
+          context: { type: "number", description: "Lines of context (default: 2)" },
+          maxResults: { type: "number", description: "Max results (default: 50)" },
+        },
+        required: ["repo", "pattern"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.search(p.repo as string, p.pattern as string, p.fileGlob as string, p.context as number, p.maxResults as number) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_ast",
+      label: "Autopsy AST",
+      description: "AST-grep structural code search",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          pattern: { type: "string", description: "ast-grep pattern" },
+          lang: { type: "string", description: "Language: ts, tsx, js, py, go, rust" },
+        },
+        required: ["repo", "pattern"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.ast(p.repo as string, p.pattern as string, p.lang as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_deps",
+      label: "Autopsy Dependencies",
+      description: "Analyze dependencies (package.json, requirements.txt, go.mod, Cargo.toml)",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.deps(p.repo as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_hotspots",
+      label: "Autopsy Hotspots",
+      description: "Find code hotspots - most changed, largest, most TODOs",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.hotspots(p.repo as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_stats",
+      label: "Autopsy Stats",
+      description: "Code statistics with tokei - lines, languages, file counts",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.stats(p.repo as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_secrets",
+      label: "Autopsy Secrets",
+      description: "Scan for leaked secrets with gitleaks",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.secrets(p.repo as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_find",
+      label: "Autopsy Find",
+      description: "Fast file finding with fd",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          pattern: { type: "string", description: "File name pattern (regex)" },
+          type: { type: "string", description: "Type: f=file, d=dir, l=symlink, x=executable" },
+          extension: { type: "string", description: "Filter by extension (e.g., 'ts')" },
+        },
+        required: ["repo", "pattern"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.find(p.repo as string, p.pattern as string, p.type as string, p.extension as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_file",
+      label: "Autopsy File",
+      description: "Read a file from cloned repo with optional line range",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          path: { type: "string", description: "File path within repo" },
+          startLine: { type: "number", description: "Start line (1-indexed)" },
+          endLine: { type: "number", description: "End line" },
+        },
+        required: ["repo", "path"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.file(p.repo as string, p.path as string, p.startLine as number, p.endLine as number) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_blame",
+      label: "Autopsy Blame",
+      description: "Git blame for a file - who wrote what",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+          path: { type: "string", description: "File path within repo" },
+          startLine: { type: "number", description: "Start line" },
+          endLine: { type: "number", description: "End line" },
+        },
+        required: ["repo", "path"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.blame(p.repo as string, p.path as string, p.startLine as number, p.endLine as number) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_exports",
+      label: "Autopsy Exports",
+      description: "Map public API - all exports from a TypeScript repo",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "GitHub repo (owner/repo or URL)" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.exports(p.repo as string) }],
+      }),
+    });
+
+    api.registerTool({
+      name: "autopsy_cleanup",
+      label: "Autopsy Cleanup",
+      description: "Remove cloned repo from local cache",
+      parameters: {
+        type: "object",
+        properties: {
+          repo: { type: "string", description: "Repo to remove, or 'all' to clear cache" },
+        },
+        required: ["repo"],
+        additionalProperties: false,
+      },
+      execute: async (_id: string, p: Record<string, unknown>) => ({
+        content: [{ type: "text", text: autopsyTools.cleanup(p.repo as string) }],
+      }),
+    });
+
+    console.log(`[openclaw-codex-ralph] Registered 24 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
   },
 };
 
