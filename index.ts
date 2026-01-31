@@ -590,7 +590,7 @@ async function executeRalphLoop(
 // ============================================================================
 
 const ralphCodexPlugin = {
-  id: "ralph-codex",
+  id: "openclaw-codex-ralph",
   name: "Ralph Codex",
   description: "Autonomous AI coding loops using Codex - fresh sessions per iteration with prd.json tracking",
   configSchema: {

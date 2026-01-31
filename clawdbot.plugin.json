@@ -1,5 +1,5 @@
 {
-  "id": "ralph-codex",
+  "id": "openclaw-codex-ralph",
   "name": "Ralph Codex",
   "description": "Autonomous AI coding loops using Codex - run fresh AI sessions per iteration with prd.json tracking",
   "kind": "tools",
