@@ -32,7 +32,7 @@ Add to your `~/.moltbot/moltbot.json`:
       "openclaw-codex-ralph": {
         "enabled": true,
         "config": {
-          "model": "o3",
+          "model": "gpt-5.2-codex",
           "sandbox": "workspace-write",
           "autoCommit": true
         }
@@ -107,7 +107,7 @@ Keeps iterating until all stories pass or limit reached.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `model` | `o3` | Codex model to use |
+| `model` | `gpt-5.2-codex` | Codex model to use |
 | `maxIterations` | `20` | Max loop iterations |
 | `sandbox` | `workspace-write` | Codex sandbox mode (`read-only`, `workspace-write`, `danger-full-access`) |
 | `autoCommit` | `true` | Auto-commit after successful iterations |

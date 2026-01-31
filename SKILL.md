@@ -274,7 +274,7 @@ Plugin config in `moltbot.json`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `model` | `o3` | Codex model to use |
+| `model` | `gpt-5.2-codex` | Codex model to use |
 | `maxIterations` | `20` | Max loop iterations |
 | `sandbox` | `workspace-write` | Codex sandbox mode |
 | `autoCommit` | `true` | Auto-commit on success |

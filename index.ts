@@ -146,7 +146,7 @@ interface PluginConfig {
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
-  model: "o3",
+  model: "gpt-5.2-codex",
   maxIterations: 20,
   sandbox: "workspace-write",
   autoCommit: true,
