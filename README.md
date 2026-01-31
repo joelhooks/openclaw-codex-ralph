@@ -171,6 +171,41 @@ Be specific with validation:
 validationCommand: "npm run typecheck && npm test -- --testPathPattern=auth"
 ```
 
+## Progress Events
+
+The plugin emits diagnostic events during loop execution:
+
+```typescript
+// Before each iteration
+{
+  type: "ralph:iteration:start",
+  plugin: "openclaw-codex-ralph",
+  data: {
+    iteration: 1,
+    maxIterations: 10,
+    storyId: "story-abc",
+    storyTitle: "Add login form",
+    workdir: "/path/to/project"
+  }
+}
+
+// After each iteration
+{
+  type: "ralph:iteration:complete",
+  plugin: "openclaw-codex-ralph",
+  data: {
+    iteration: 1,
+    success: true,
+    toolCalls: 12,
+    filesModified: ["src/login.tsx", "src/api/auth.ts"],
+    duration: 45000,
+    storiesCompleted: 1
+  }
+}
+```
+
+For real-time progress in moltbot, you can also call `ralph_iterate` repeatedly instead of `ralph_loop` - this gives natural progress updates between iterations.
+
 ## Inspiration
 
 - [Ralph](https://github.com/snarktank/ralph) - The original autonomous AI agent loop pattern
