@@ -1,0 +1,41 @@
+{
+  "id": "ralph-codex",
+  "name": "Ralph Codex",
+  "description": "Autonomous AI coding loops using Codex - run fresh AI sessions per iteration with prd.json tracking",
+  "kind": "tools",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "model": {
+        "type": "string",
+        "default": "o3",
+        "description": "Model to use for codex iterations"
+      },
+      "maxIterations": {
+        "type": "number",
+        "default": 20,
+        "description": "Maximum loop iterations before stopping"
+      },
+      "sandbox": {
+        "type": "string",
+        "enum": ["read-only", "workspace-write", "danger-full-access"],
+        "default": "workspace-write",
+        "description": "Codex sandbox mode"
+      },
+      "autoCommit": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-commit after each successful iteration"
+      },
+      "debug": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable debug logging"
+      }
+    },
+    "additionalProperties": false
+  },
+  "uiHints": {
+    "model": { "label": "Model", "description": "Codex model (o3, gpt-4.1, etc.)" }
+  }
+}
