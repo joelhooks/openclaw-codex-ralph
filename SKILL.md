@@ -290,3 +290,121 @@ Plugin config in `moltbot.json`:
 4. **Monitor progress.txt** — See what Codex learned/failed
 5. **Dry run first** — `ralph_iterate(workdir, dryRun=true)` to preview
 6. **Single iterations** — Better visibility than `ralph_loop`
+
+---
+
+## Learning Capture SOP (Hivemind Integration)
+
+Ralph integrates with the `swarm memory` hivemind for persistent cross-session learning. This happens automatically — no configuration needed.
+
+### How It Works
+
+1. **Pre-iteration context query** — Before each iteration, Ralph queries hivemind with the current story title to retrieve relevant prior learnings. These are injected into the Codex prompt as a "Prior Learnings" section.
+
+2. **Post-success learning capture** — After a story completes and is committed, Ralph stores a summary in hivemind:
+   - Story title + files modified + Codex summary
+   - Tags: `ralph,learning,{projectName}`
+
+3. **Failure pattern storage** — On validation failure, Ralph stores the failure pattern:
+   - Story title + files + error output (truncated to 500 chars) + failure category
+   - Tags: `ralph,failure,{failureCategory},{projectName}`
+
+### Requirements
+
+- `swarm` CLI must be in PATH (checked once, cached)
+- All hivemind calls are wrapped in try/catch — failures never break the loop
+- Timeout: 15 seconds per hivemind call
+
+### Querying Learnings Manually
+
+```bash
+# Find all learnings for a project
+swarm memory find "ralph learning MyProject" --limit 20
+
+# Find failure patterns
+swarm memory find "ralph failure MyProject" --limit 10
+
+# Find specific failure types
+swarm memory find "ralph failure type_error MyProject"
+```
+
+---
+
+## Event Monitoring
+
+Ralph emits event files to `~/.openclaw/ralph-events/` for monitoring by HEARTBEAT.md or external tools.
+
+### Event Types
+
+| Event | When | Key Fields |
+|-------|------|------------|
+| `loop_start` | Loop begins | `jobId`, `totalStories`, `workdir` |
+| `story_complete` | Story passes validation + commits | `storyId`, `storyTitle`, `filesModified`, `commitHash`, `duration`, `summary` |
+| `story_failed` | Story fails validation | `storyId`, `storyTitle`, `error`, `category`, `duration` |
+| `loop_complete` | Loop finishes (all done or max iterations) | `storiesCompleted`, `totalStories`, `duration`, `results[]` |
+| `loop_error` | Loop stops on error/cancellation | `error`, `storiesCompleted`, `lastStory` |
+
+### Event File Format
+
+Files are JSON, named `{timestamp}-{type}-{jobId}.json`. Located in `~/.openclaw/ralph-events/`.
+
+Old events (>24h) are auto-cleaned at loop start.
+
+### Monitoring in HEARTBEAT.md
+
+```bash
+# Check for recent events
+ls -lt ~/.openclaw/ralph-events/ | head -5
+
+# Read latest event
+cat $(ls -t ~/.openclaw/ralph-events/*.json | head -1) | jq .
+```
+
+See `docs/EVENTS.md` in the plugin repo for full schema documentation.
+
+---
+
+## Failure Categories
+
+Ralph classifies validation failures to enable smarter iteration and pattern detection.
+
+| Category | Detected By | Examples |
+|----------|------------|---------|
+| `type_error` | `error ts`, `ts(`, `not assignable`, `cannot find name` | TypeScript compilation errors |
+| `test_failure` | `assert`, `expect(`, `test fail`, `tests failed` | Jest/Vitest/Mocha assertion failures |
+| `lint_error` | `eslint`, `prettier`, `lint` | Linting and formatting errors |
+| `build_error` | `build fail`, `bundle`, `esbuild`, `webpack`, `rollup`, `vite` | Build/bundling failures |
+| `timeout` | `timeout`, `exceeded`, `timed out` | Command or iteration timeout |
+| `unknown` | (fallback) | Everything else |
+
+Categories are stored in:
+- **Ralph events** (`story_failed` events include `category` field)
+- **Hivemind** (tagged with category for searchability)
+- **Structured context** (`.ralph-context.json` failures include category)
+
+### Structured Context (.ralph-context.json)
+
+In addition to `progress.txt` (human-readable), Ralph maintains `.ralph-context.json` for machine consumption:
+
+```json
+{
+  "stories": [
+    {
+      "id": "story-abc",
+      "title": "Add login form",
+      "status": "completed",
+      "filesModified": ["src/login.tsx"],
+      "learnings": "Used shadcn/ui form components..."
+    }
+  ],
+  "failures": [
+    {
+      "storyId": "story-def",
+      "category": "type_error",
+      "error": "Type 'string' is not assignable to type 'number'..."
+    }
+  ]
+}
+```
+
+This structured context is automatically included in iteration prompts, giving Codex awareness of recent successes and failure patterns.

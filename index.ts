@@ -162,7 +162,7 @@ interface RalphEvent {
   duration?: number;
   commitHash?: string;
   error?: string;
-  category?: FailureCategory;
+  failureCategory?: FailureCategory;
   workdir?: string;
   totalStories?: number;
   storiesCompleted?: number;
@@ -310,6 +310,58 @@ function buildStructuredContextSnippet(workdir: string): string {
   }
 
   return parts.join("\n");
+}
+
+/**
+ * Read inter-story context: combines PROGRESS.md content with recent ralph events.
+ * Gives each Codex iteration awareness of what happened in prior iterations.
+ */
+function readStoryContext(workdir: string): string {
+  const parts: string[] = [];
+
+  // Include tail of progress log
+  const progress = readProgress(workdir);
+  if (progress) {
+    const trimmed = progress.length > 1500 ? progress.slice(-1500) : progress;
+    parts.push("## Recent Progress\n" + trimmed);
+  }
+
+  // Include recent ralph events (last 10)
+  try {
+    if (existsSync(RALPH_EVENTS_DIR)) {
+      const files = readdirSync(RALPH_EVENTS_DIR)
+        .filter((f) => f.endsWith(".json"))
+        .sort()
+        .slice(-10);
+      const eventSummaries: string[] = [];
+      for (const file of files) {
+        try {
+          const event = JSON.parse(readFileSync(join(RALPH_EVENTS_DIR, file), "utf-8")) as RalphEvent;
+          if (event.type === "story_complete") {
+            eventSummaries.push(`✅ ${event.storyTitle}: ${event.summary?.slice(0, 150) || "completed"}`);
+          } else if (event.type === "story_failed") {
+            const cat = event.failureCategory ? ` [${event.failureCategory}]` : "";
+            eventSummaries.push(`❌ ${event.storyTitle}${cat}: ${event.error?.slice(0, 150) || "failed"}`);
+          }
+        } catch {
+          // skip malformed event files
+        }
+      }
+      if (eventSummaries.length > 0) {
+        parts.push("## Recent Events\n" + eventSummaries.join("\n"));
+      }
+    }
+  } catch {
+    // ignore event reading errors
+  }
+
+  // Include structured context from .ralph-context.json
+  const structured = buildStructuredContextSnippet(workdir);
+  if (structured) {
+    parts.push("## Structured Context\n" + structured);
+  }
+
+  return parts.join("\n\n");
 }
 
 // ============================================================================
@@ -1158,7 +1210,7 @@ async function executeRalphIterate(
       storyId: story.id,
       storyTitle: story.title,
       error: validation.output.slice(0, 500),
-      category: failureCategory,
+      failureCategory: failureCategory,
       duration: result.duration,
       workdir,
     });
@@ -1493,7 +1545,7 @@ async function executeRalphLoopAsync(
           storyId: story.id,
           storyTitle: story.title,
           error: validation.output.slice(0, 500),
-          category: failureCategory,
+          failureCategory: failureCategory,
           duration: iterResult.duration,
           workdir,
         });
