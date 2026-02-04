@@ -7,8 +7,8 @@
  *
  * Based on: https://github.com/snarktank/ralph
  */
-import type { MoltbotPluginApi } from "clawdbot/plugin-sdk";
-import { emitDiagnosticEvent } from "clawdbot/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { emitDiagnosticEvent } from "openclaw/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
 import { join, resolve, basename } from "path";
@@ -1162,7 +1162,7 @@ const ralphCodexPlugin = {
     additionalProperties: false,
   },
 
-  register(api: MoltbotPluginApi) {
+  register(api: OpenClawPluginApi) {
     const cfg: PluginConfig = {
       ...DEFAULT_CONFIG,
       ...(api.pluginConfig as Partial<PluginConfig>),

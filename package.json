@@ -4,6 +4,11 @@
   "description": "Autonomous AI coding loops using Codex - run fresh AI sessions per iteration with prd.json tracking",
   "type": "module",
   "main": "index.ts",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
   "moltbot": {
     "extensions": [
       "./index.ts"
@@ -15,6 +20,7 @@
     ]
   },
   "keywords": [
+    "openclaw",
     "moltbot",
     "clawdbot",
     "plugin",
