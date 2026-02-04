@@ -209,6 +209,54 @@ function cleanupOldEvents(maxAgeMs: number = 86400000): void {
 }
 
 // ============================================================================
+// Hivemind Integration (Learning Capture)
+// ============================================================================
+
+let _swarmAvailable: boolean | null = null;
+
+function isSwarmAvailable(): boolean {
+  if (_swarmAvailable !== null) return _swarmAvailable;
+  try {
+    execSync("which swarm", { encoding: "utf-8", stdio: "pipe" });
+    _swarmAvailable = true;
+  } catch {
+    _swarmAvailable = false;
+  }
+  return _swarmAvailable;
+}
+
+function hivemindStore(information: string, tags: string): void {
+  if (!isSwarmAvailable()) return;
+  try {
+    // Use -- to prevent information from being parsed as flags
+    const safeInfo = information.replace(/"/g, '\\"').replace(/\n/g, " ").slice(0, 1000);
+    const safeTags = tags.replace(/"/g, "");
+    execSync(`swarm memory store "${safeInfo}" --tags "${safeTags}"`, {
+      encoding: "utf-8",
+      timeout: 15000,
+      stdio: "pipe",
+    });
+  } catch {
+    // Hivemind failures must never break the loop
+  }
+}
+
+function hivemindFind(query: string, limit: number = 3): string {
+  if (!isSwarmAvailable()) return "";
+  try {
+    const safeQuery = query.replace(/"/g, '\\"').replace(/\n/g, " ");
+    const result = execSync(`swarm memory find "${safeQuery}" --limit ${limit}`, {
+      encoding: "utf-8",
+      timeout: 15000,
+      stdio: "pipe",
+    });
+    return result.trim();
+  } catch {
+    return "";
+  }
+}
+
+// ============================================================================
 // Session Types (codexmonitor port)
 // ============================================================================
 
@@ -304,6 +352,36 @@ function readAgentsMd(workdir: string): string {
   const agentsPath = join(resolvePath(workdir), "AGENTS.md");
   if (!existsSync(agentsPath)) return "";
   return readFileSync(agentsPath, "utf-8");
+}
+
+// ============================================================================
+// Hivemind Integration Helpers
+// ============================================================================
+
+function queryHivemindContext(storyTitle: string): string {
+  try {
+    const output = execSync(
+      `swarm memory find "${storyTitle.replace(/"/g, '\\"')}" --limit 3`,
+      { encoding: "utf-8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    if (output && output.trim()) {
+      return output.trim();
+    }
+  } catch {
+    // Never block the loop if hivemind query fails
+  }
+  return "";
+}
+
+function storeHivemindMemory(info: string, tags: string): void {
+  try {
+    execSync(
+      `swarm memory store "${info.replace(/"/g, '\\"').replace(/\n/g, " ")}" --tags "${tags}"`,
+      { timeout: 10000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+  } catch {
+    // Never break the loop if memory store fails
+  }
 }
 
 function getNextStory(prd: PRD): Story | null {
@@ -503,7 +581,7 @@ function gitCommit(workdir: string, message: string): string | null {
   }
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -535,6 +613,13 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     // Only include last ~2000 chars to avoid context bloat
     const trimmedProgress = progress.length > 2000 ? "...\n" + progress.slice(-2000) : progress;
     parts.push(trimmedProgress);
+  }
+
+  if (hivemindContext) {
+    parts.push(`\n## Prior Learnings (from hivemind)`);
+    // Trim to avoid context bloat
+    const trimmed = hivemindContext.length > 1500 ? hivemindContext.slice(0, 1500) + "\n..." : hivemindContext;
+    parts.push(trimmed);
   }
 
   parts.push(`\n## Instructions`);
@@ -864,7 +949,10 @@ async function executeRalphIterate(
 
   const progress = readProgress(workdir);
   const agentsMd = readAgentsMd(workdir);
-  const prompt = buildIterationPrompt(prd, story, progress, agentsMd);
+
+  // Pre-iteration: query hivemind for relevant prior learnings
+  const hivemindContext = hivemindFind(story.title);
+  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined);
 
   if (dryRun) {
     return {
@@ -920,6 +1008,14 @@ async function executeRalphIterate(
       result.commitHash = hash || undefined;
     }
 
+    // Post-success: store learning in hivemind (only if committed)
+    if (result.commitHash) {
+      hivemindStore(
+        `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+        `ralph,learning,${prd.projectName}`
+      );
+    }
+
     // Story complete notification
     writeRalphEvent("story_complete", {
       jobId: iterateJobId,
@@ -942,6 +1038,12 @@ async function executeRalphIterate(
       `Codex message: ${codexResult.finalMessage.slice(0, 500)}`,
     ].join("\n");
     appendProgress(workdir, failureEntry);
+
+    // Store failure pattern in hivemind
+    hivemindStore(
+      `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+      `ralph,failure,${prd.projectName}`
+    );
 
     // Story failure notification
     writeRalphEvent("story_failed", {
@@ -996,7 +1098,10 @@ async function executeRalphLoopSync(
 
     const progress = readProgress(workdir);
     const agentsMd = readAgentsMd(workdir);
-    const prompt = buildIterationPrompt(prd, story, progress, agentsMd);
+
+    // Pre-iteration: query hivemind for relevant prior learnings
+    const hivemindCtx = hivemindFind(story.title);
+    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined);
 
     const startTime = Date.now();
     const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1033,6 +1138,14 @@ async function executeRalphLoopSync(
         const hash = gitCommit(workdir, `ralph: ${story.title}`);
         iterResult.commitHash = hash || undefined;
       }
+
+      // Post-success: store learning in hivemind
+      if (iterResult.commitHash) {
+        hivemindStore(
+          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+          `ralph,learning,${prd.projectName}`
+        );
+      }
     } else {
       const failEntry = [
         `Failed: ${story.title}`,
@@ -1040,6 +1153,12 @@ async function executeRalphLoopSync(
         `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
       ].join("\n");
       appendProgress(workdir, failEntry);
+
+      // Store failure pattern in hivemind
+      hivemindStore(
+        `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+        `ralph,failure,${prd.projectName}`
+      );
 
       if (stopOnFailure) {
         loopResult.stoppedReason = "failure";
@@ -1132,7 +1251,10 @@ async function executeRalphLoopAsync(
 
       const progress = readProgress(workdir);
       const agentsMd = readAgentsMd(workdir);
-      const prompt = buildIterationPrompt(prd, story, progress, agentsMd);
+
+      // Pre-iteration: query hivemind for relevant prior learnings
+      const hivemindCtx = hivemindFind(story.title);
+      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined);
 
       const startTime = Date.now();
       const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1172,6 +1294,14 @@ async function executeRalphLoopAsync(
           iterResult.commitHash = hash || undefined;
         }
 
+        // Post-success: store learning in hivemind (only if committed)
+        if (iterResult.commitHash) {
+          hivemindStore(
+            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+            `ralph,learning,${prd.projectName}`
+          );
+        }
+
         // Story complete notification
         writeRalphEvent("story_complete", {
           jobId: job.id,
@@ -1192,6 +1322,12 @@ async function executeRalphLoopAsync(
           `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
         ].join("\n");
         appendProgress(workdir, failEntry);
+
+        // Store failure pattern in hivemind
+        hivemindStore(
+          `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+          `ralph,failure,${prd.projectName}`
+        );
 
         // Story failure notification
         writeRalphEvent("story_failed", {
