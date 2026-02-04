@@ -162,6 +162,7 @@ interface RalphEvent {
   duration?: number;
   commitHash?: string;
   error?: string;
+  category?: FailureCategory;
   workdir?: string;
   totalStories?: number;
   storiesCompleted?: number;
@@ -206,6 +207,109 @@ function cleanupOldEvents(maxAgeMs: number = 86400000): void {
   } catch {
     // ignore cleanup errors
   }
+}
+
+// ============================================================================
+// Failure Categorization
+// ============================================================================
+
+type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "unknown";
+
+function categorizeFailure(output: string): FailureCategory {
+  const lower = output.toLowerCase();
+  if (lower.includes("timeout") || lower.includes("exceeded 10 minutes") || lower.includes("timed out")) return "timeout";
+  if (lower.includes("error ts") || lower.includes("ts(") || (lower.includes("type") && lower.includes("not assignable")) || lower.includes("cannot find name")) return "type_error";
+  if (lower.includes("eslint") || lower.includes("prettier") || lower.includes("lint")) return "lint_error";
+  if (lower.includes("assert") || lower.includes("expect(") || lower.includes("test fail") || lower.includes("tests failed") || lower.includes("test suites failed")) return "test_failure";
+  if (lower.includes("build fail") || lower.includes("bundle") || lower.includes("esbuild") || lower.includes("webpack") || lower.includes("rollup") || lower.includes("vite")) return "build_error";
+  return "unknown";
+}
+
+// ============================================================================
+// Structured Inter-Story Context (.ralph-context.json)
+// ============================================================================
+
+interface RalphContextStory {
+  id: string;
+  title: string;
+  status: "completed" | "failed";
+  filesModified: string[];
+  learnings: string;
+}
+
+interface RalphContextFailure {
+  storyId: string;
+  category: FailureCategory;
+  error: string;
+}
+
+interface RalphContext {
+  stories: RalphContextStory[];
+  failures: RalphContextFailure[];
+}
+
+function readRalphContext(workdir: string): RalphContext {
+  const contextPath = join(resolvePath(workdir), ".ralph-context.json");
+  if (!existsSync(contextPath)) return { stories: [], failures: [] };
+  try {
+    return JSON.parse(readFileSync(contextPath, "utf-8"));
+  } catch {
+    return { stories: [], failures: [] };
+  }
+}
+
+function writeRalphContext(workdir: string, context: RalphContext): void {
+  const contextPath = join(resolvePath(workdir), ".ralph-context.json");
+  writeFileSync(contextPath, JSON.stringify(context, null, 2));
+}
+
+function addContextStory(workdir: string, entry: RalphContextStory): void {
+  const ctx = readRalphContext(workdir);
+  // Replace existing entry for the same story id, or append
+  const idx = ctx.stories.findIndex((s) => s.id === entry.id);
+  if (idx >= 0) {
+    ctx.stories[idx] = entry;
+  } else {
+    ctx.stories.push(entry);
+  }
+  writeRalphContext(workdir, ctx);
+}
+
+function addContextFailure(workdir: string, failure: RalphContextFailure): void {
+  const ctx = readRalphContext(workdir);
+  ctx.failures.push(failure);
+  // Keep only last 20 failures to avoid bloat
+  if (ctx.failures.length > 20) {
+    ctx.failures = ctx.failures.slice(-20);
+  }
+  writeRalphContext(workdir, ctx);
+}
+
+function buildStructuredContextSnippet(workdir: string): string {
+  const ctx = readRalphContext(workdir);
+  if (ctx.stories.length === 0 && ctx.failures.length === 0) return "";
+
+  const parts: string[] = [];
+
+  // Recent completed stories (last 5)
+  const completed = ctx.stories.filter((s) => s.status === "completed").slice(-5);
+  if (completed.length > 0) {
+    parts.push("Recent completions:");
+    for (const s of completed) {
+      parts.push(`  - ${s.title}: ${s.learnings.slice(0, 200)}`);
+    }
+  }
+
+  // Recent failures (last 5)
+  const failures = ctx.failures.slice(-5);
+  if (failures.length > 0) {
+    parts.push("Recent failures:");
+    for (const f of failures) {
+      parts.push(`  - [${f.category}] Story ${f.storyId}: ${f.error.slice(0, 150)}`);
+    }
+  }
+
+  return parts.join("\n");
 }
 
 // ============================================================================
@@ -352,36 +456,6 @@ function readAgentsMd(workdir: string): string {
   const agentsPath = join(resolvePath(workdir), "AGENTS.md");
   if (!existsSync(agentsPath)) return "";
   return readFileSync(agentsPath, "utf-8");
-}
-
-// ============================================================================
-// Hivemind Integration Helpers
-// ============================================================================
-
-function queryHivemindContext(storyTitle: string): string {
-  try {
-    const output = execSync(
-      `swarm memory find "${storyTitle.replace(/"/g, '\\"')}" --limit 3`,
-      { encoding: "utf-8", timeout: 10000, stdio: ["pipe", "pipe", "pipe"] }
-    );
-    if (output && output.trim()) {
-      return output.trim();
-    }
-  } catch {
-    // Never block the loop if hivemind query fails
-  }
-  return "";
-}
-
-function storeHivemindMemory(info: string, tags: string): void {
-  try {
-    execSync(
-      `swarm memory store "${info.replace(/"/g, '\\"').replace(/\n/g, " ")}" --tags "${tags}"`,
-      { timeout: 10000, stdio: ["pipe", "pipe", "pipe"] }
-    );
-  } catch {
-    // Never break the loop if memory store fails
-  }
 }
 
 function getNextStory(prd: PRD): Story | null {
@@ -581,7 +655,7 @@ function gitCommit(workdir: string, message: string): string | null {
   }
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -613,6 +687,11 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     // Only include last ~2000 chars to avoid context bloat
     const trimmedProgress = progress.length > 2000 ? "...\n" + progress.slice(-2000) : progress;
     parts.push(trimmedProgress);
+  }
+
+  if (structuredContext) {
+    parts.push(`\n## Structured Context (machine-generated)`);
+    parts.push(structuredContext);
   }
 
   if (hivemindContext) {
@@ -952,7 +1031,9 @@ async function executeRalphIterate(
 
   // Pre-iteration: query hivemind for relevant prior learnings
   const hivemindContext = hivemindFind(story.title);
-  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined);
+  // Read structured context from .ralph-context.json
+  const structuredCtx = buildStructuredContextSnippet(workdir);
+  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined);
 
   if (dryRun) {
     return {
@@ -1016,6 +1097,15 @@ async function executeRalphIterate(
       );
     }
 
+    // Update structured context
+    addContextStory(workdir, {
+      id: story.id,
+      title: story.title,
+      status: "completed",
+      filesModified: codexResult.filesModified,
+      learnings: codexResult.finalMessage.slice(0, 500),
+    });
+
     // Story complete notification
     writeRalphEvent("story_complete", {
       jobId: iterateJobId,
@@ -1028,9 +1118,12 @@ async function executeRalphIterate(
       workdir,
     });
   } else {
+    // Categorize the failure
+    const failureCategory = categorizeFailure(validation.output);
+
     // Log failure with details
     const failureEntry = [
-      `Failed: ${story.title}`,
+      `Failed: ${story.title} [${failureCategory}]`,
       `Codex success: ${codexResult.success}`,
       `Validation success: ${validation.success}`,
       `Files touched: ${codexResult.filesModified.join(", ") || "none"}`,
@@ -1039,18 +1132,33 @@ async function executeRalphIterate(
     ].join("\n");
     appendProgress(workdir, failureEntry);
 
-    // Store failure pattern in hivemind
+    // Store failure pattern in hivemind (with category)
     hivemindStore(
-      `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-      `ralph,failure,${prd.projectName}`
+      `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+      `ralph,failure,${failureCategory},${prd.projectName}`
     );
 
-    // Story failure notification
+    // Update structured context with failure
+    addContextStory(workdir, {
+      id: story.id,
+      title: story.title,
+      status: "failed",
+      filesModified: codexResult.filesModified,
+      learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
+    });
+    addContextFailure(workdir, {
+      storyId: story.id,
+      category: failureCategory,
+      error: validation.output.slice(0, 500),
+    });
+
+    // Story failure notification (with category)
     writeRalphEvent("story_failed", {
       jobId: iterateJobId,
       storyId: story.id,
       storyTitle: story.title,
       error: validation.output.slice(0, 500),
+      category: failureCategory,
       duration: result.duration,
       workdir,
     });
@@ -1101,7 +1209,8 @@ async function executeRalphLoopSync(
 
     // Pre-iteration: query hivemind for relevant prior learnings
     const hivemindCtx = hivemindFind(story.title);
-    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined);
+    const structuredCtx = buildStructuredContextSnippet(workdir);
+    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined);
 
     const startTime = Date.now();
     const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1146,19 +1255,43 @@ async function executeRalphLoopSync(
           `ralph,learning,${prd.projectName}`
         );
       }
+
+      // Update structured context
+      addContextStory(workdir, {
+        id: story.id,
+        title: story.title,
+        status: "completed",
+        filesModified: codexResult.filesModified,
+        learnings: codexResult.finalMessage.slice(0, 500),
+      });
     } else {
+      const failureCategory = categorizeFailure(validation.output);
       const failEntry = [
-        `Failed: ${story.title}`,
+        `Failed: ${story.title} [${failureCategory}]`,
         `Validation: ${validation.output.slice(0, 300)}`,
         `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
       ].join("\n");
       appendProgress(workdir, failEntry);
 
-      // Store failure pattern in hivemind
+      // Store failure pattern in hivemind (with category)
       hivemindStore(
-        `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-        `ralph,failure,${prd.projectName}`
+        `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+        `ralph,failure,${failureCategory},${prd.projectName}`
       );
+
+      // Update structured context with failure
+      addContextStory(workdir, {
+        id: story.id,
+        title: story.title,
+        status: "failed",
+        filesModified: codexResult.filesModified,
+        learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
+      });
+      addContextFailure(workdir, {
+        storyId: story.id,
+        category: failureCategory,
+        error: validation.output.slice(0, 500),
+      });
 
       if (stopOnFailure) {
         loopResult.stoppedReason = "failure";
@@ -1254,7 +1387,8 @@ async function executeRalphLoopAsync(
 
       // Pre-iteration: query hivemind for relevant prior learnings
       const hivemindCtx = hivemindFind(story.title);
-      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined);
+      const structuredCtx = buildStructuredContextSnippet(workdir);
+      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined);
 
       const startTime = Date.now();
       const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1302,6 +1436,15 @@ async function executeRalphLoopAsync(
           );
         }
 
+        // Update structured context
+        addContextStory(workdir, {
+          id: story.id,
+          title: story.title,
+          status: "completed",
+          filesModified: codexResult.filesModified,
+          learnings: codexResult.finalMessage.slice(0, 500),
+        });
+
         // Story complete notification
         writeRalphEvent("story_complete", {
           jobId: job.id,
@@ -1316,25 +1459,41 @@ async function executeRalphLoopAsync(
 
         emitLoopProgress(job, "iteration");
       } else {
+        const failureCategory = categorizeFailure(validation.output);
         const failEntry = [
-          `Failed: ${story.title}`,
+          `Failed: ${story.title} [${failureCategory}]`,
           `Validation: ${validation.output.slice(0, 300)}`,
           `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
         ].join("\n");
         appendProgress(workdir, failEntry);
 
-        // Store failure pattern in hivemind
+        // Store failure pattern in hivemind (with category)
         hivemindStore(
-          `Ralph failure: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-          `ralph,failure,${prd.projectName}`
+          `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+          `ralph,failure,${failureCategory},${prd.projectName}`
         );
 
-        // Story failure notification
+        // Update structured context with failure
+        addContextStory(workdir, {
+          id: story.id,
+          title: story.title,
+          status: "failed",
+          filesModified: codexResult.filesModified,
+          learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
+        });
+        addContextFailure(workdir, {
+          storyId: story.id,
+          category: failureCategory,
+          error: validation.output.slice(0, 500),
+        });
+
+        // Story failure notification (with category)
         writeRalphEvent("story_failed", {
           jobId: job.id,
           storyId: story.id,
           storyTitle: story.title,
           error: validation.output.slice(0, 500),
+          category: failureCategory,
           duration: iterResult.duration,
           workdir,
         });
