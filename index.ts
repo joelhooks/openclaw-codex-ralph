@@ -10,7 +10,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emitDiagnosticEvent } from "openclaw/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
-import { readFileSync, writeFileSync, existsSync, readdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, statSync } from "fs";
 import { join, resolve, basename } from "path";
 import { homedir } from "os";
 import { autopsyTools } from "./autopsy.js";
@@ -143,6 +143,69 @@ function emitLoopProgress(job: LoopJob, event: "start" | "iteration" | "complete
       error: job.error,
     },
   });
+}
+
+// ============================================================================
+// Event Notification System
+// ============================================================================
+
+const RALPH_EVENTS_DIR = join(homedir(), ".openclaw", "ralph-events");
+
+interface RalphEvent {
+  timestamp: string;
+  jobId: string;
+  type: string;
+  storyId?: string;
+  storyTitle?: string;
+  summary?: string;
+  filesModified?: string[];
+  duration?: number;
+  commitHash?: string;
+  error?: string;
+  workdir?: string;
+  totalStories?: number;
+  storiesCompleted?: number;
+  lastStory?: { id: string; title: string };
+  results?: Array<{ storyTitle: string; success: boolean; duration: number }>;
+}
+
+function writeRalphEvent(type: string, data: Partial<RalphEvent> & { jobId: string }): void {
+  try {
+    mkdirSync(RALPH_EVENTS_DIR, { recursive: true });
+    const timestamp = new Date().toISOString();
+    const event: RalphEvent = {
+      timestamp,
+      type,
+      ...data,
+    };
+    const safeTimestamp = Date.now();
+    const filename = `${safeTimestamp}-${type}-${data.jobId}.json`;
+    writeFileSync(join(RALPH_EVENTS_DIR, filename), JSON.stringify(event, null, 2));
+  } catch (err) {
+    // Don't let event writing failures break the loop
+    console.error(`[openclaw-codex-ralph] Failed to write event: ${err}`);
+  }
+}
+
+function cleanupOldEvents(maxAgeMs: number = 86400000): void {
+  try {
+    if (!existsSync(RALPH_EVENTS_DIR)) return;
+    const now = Date.now();
+    const files = readdirSync(RALPH_EVENTS_DIR);
+    for (const file of files) {
+      const filePath = join(RALPH_EVENTS_DIR, file);
+      try {
+        const stat = statSync(filePath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          unlinkSync(filePath);
+        }
+      } catch {
+        // skip files we can't stat/delete
+      }
+    }
+  } catch {
+    // ignore cleanup errors
+  }
 }
 
 // ============================================================================
@@ -831,6 +894,8 @@ async function executeRalphIterate(
     duration: Date.now() - startTime,
   };
 
+  const iterateJobId = `iterate-${Date.now().toString(36)}`;
+
   if (result.success) {
     // Mark story as passed
     story.passes = true;
@@ -854,6 +919,18 @@ async function executeRalphIterate(
       const hash = gitCommit(workdir, `ralph: ${story.title}`);
       result.commitHash = hash || undefined;
     }
+
+    // Story complete notification
+    writeRalphEvent("story_complete", {
+      jobId: iterateJobId,
+      storyId: story.id,
+      storyTitle: story.title,
+      filesModified: codexResult.filesModified,
+      commitHash: result.commitHash,
+      duration: result.duration,
+      summary: codexResult.finalMessage.slice(0, 500),
+      workdir,
+    });
   } else {
     // Log failure with details
     const failureEntry = [
@@ -865,6 +942,16 @@ async function executeRalphIterate(
       `Codex message: ${codexResult.finalMessage.slice(0, 500)}`,
     ].join("\n");
     appendProgress(workdir, failureEntry);
+
+    // Story failure notification
+    writeRalphEvent("story_failed", {
+      jobId: iterateJobId,
+      storyId: story.id,
+      storyTitle: story.title,
+      error: validation.output.slice(0, 500),
+      duration: result.duration,
+      workdir,
+    });
   }
 
   return result;
@@ -994,10 +1081,21 @@ async function executeRalphLoopAsync(
 
   emitLoopProgress(job, "start");
 
+  // Clean up old event files and emit loop_start
+  cleanupOldEvents();
+  writeRalphEvent("loop_start", { jobId: job.id, totalStories: job.totalStories, workdir });
+
   try {
     for (let i = 0; i < maxIterations; i++) {
       // Check for cancellation
       if (job.status === "cancelled") {
+        writeRalphEvent("loop_error", {
+          jobId: job.id,
+          error: "Loop cancelled",
+          storiesCompleted: job.storiesCompleted,
+          lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
+          workdir,
+        });
         emitLoopProgress(job, "complete");
         return;
       }
@@ -1016,6 +1114,14 @@ async function executeRalphLoopAsync(
       if (!story) {
         job.status = "completed";
         job.completedAt = Date.now();
+        writeRalphEvent("loop_complete", {
+          jobId: job.id,
+          storiesCompleted: job.storiesCompleted,
+          totalStories: job.totalStories,
+          duration: Date.now() - job.startedAt,
+          results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })),
+          workdir,
+        });
         emitLoopProgress(job, "complete");
         return;
       }
@@ -1066,6 +1172,18 @@ async function executeRalphLoopAsync(
           iterResult.commitHash = hash || undefined;
         }
 
+        // Story complete notification
+        writeRalphEvent("story_complete", {
+          jobId: job.id,
+          storyId: story.id,
+          storyTitle: story.title,
+          filesModified: codexResult.filesModified,
+          commitHash: iterResult.commitHash,
+          duration: iterResult.duration,
+          summary: codexResult.finalMessage.slice(0, 500),
+          workdir,
+        });
+
         emitLoopProgress(job, "iteration");
       } else {
         const failEntry = [
@@ -1075,10 +1193,27 @@ async function executeRalphLoopAsync(
         ].join("\n");
         appendProgress(workdir, failEntry);
 
+        // Story failure notification
+        writeRalphEvent("story_failed", {
+          jobId: job.id,
+          storyId: story.id,
+          storyTitle: story.title,
+          error: validation.output.slice(0, 500),
+          duration: iterResult.duration,
+          workdir,
+        });
+
         if (stopOnFailure) {
           job.status = "failed";
           job.error = `Story failed: ${story.title}`;
           job.completedAt = Date.now();
+          writeRalphEvent("loop_error", {
+            jobId: job.id,
+            error: job.error,
+            storiesCompleted: job.storiesCompleted,
+            lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
+            workdir,
+          });
           emitLoopProgress(job, "error");
           return;
         }
@@ -1098,12 +1233,33 @@ async function executeRalphLoopAsync(
       job.error = `Max iterations reached with ${remaining} stories remaining`;
     }
     job.completedAt = Date.now();
+
+    // Loop complete notification
+    writeRalphEvent("loop_complete", {
+      jobId: job.id,
+      storiesCompleted: job.storiesCompleted,
+      totalStories: job.totalStories,
+      duration: Date.now() - job.startedAt,
+      results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })),
+      workdir,
+    });
+
     emitLoopProgress(job, "complete");
 
   } catch (err) {
     job.status = "failed";
     job.error = err instanceof Error ? err.message : String(err);
     job.completedAt = Date.now();
+
+    // Loop error notification
+    writeRalphEvent("loop_error", {
+      jobId: job.id,
+      error: job.error,
+      storiesCompleted: job.storiesCompleted,
+      lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
+      workdir,
+    });
+
     emitLoopProgress(job, "error");
   }
 }
