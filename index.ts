@@ -150,6 +150,7 @@ function emitLoopProgress(job: LoopJob, event: "start" | "iteration" | "complete
 // ============================================================================
 
 const RALPH_EVENTS_DIR = join(homedir(), ".openclaw", "ralph-events");
+const RALPH_CURSOR_FILE = join(homedir(), ".openclaw", "ralph-cursor.json");
 
 interface RalphEvent {
   timestamp: string;
@@ -207,6 +208,53 @@ function cleanupOldEvents(maxAgeMs: number = 86400000): void {
   } catch {
     // ignore cleanup errors
   }
+}
+
+// ============================================================================
+// Fix Cursor (timestamp bookmarks for log/transcript scoping)
+// ============================================================================
+
+interface CursorEntry {
+  timestamp: string;
+  epoch: number;
+  label: string;
+  details?: string;
+}
+
+interface CursorFile {
+  entries: CursorEntry[];
+}
+
+function readCursor(): CursorFile {
+  try {
+    if (!existsSync(RALPH_CURSOR_FILE)) return { entries: [] };
+    return JSON.parse(readFileSync(RALPH_CURSOR_FILE, "utf-8"));
+  } catch {
+    return { entries: [] };
+  }
+}
+
+function writeCursorEntry(label: string, details?: string): CursorEntry {
+  const cursor = readCursor();
+  const entry: CursorEntry = {
+    timestamp: new Date().toISOString(),
+    epoch: Date.now(),
+    label,
+    details,
+  };
+  cursor.entries.push(entry);
+  // Keep last 50 entries
+  if (cursor.entries.length > 50) {
+    cursor.entries = cursor.entries.slice(-50);
+  }
+  mkdirSync(join(homedir(), ".openclaw"), { recursive: true });
+  writeFileSync(RALPH_CURSOR_FILE, JSON.stringify(cursor, null, 2));
+  return entry;
+}
+
+function getLastCursor(): CursorEntry | null {
+  const cursor = readCursor();
+  return cursor.entries.length > 0 ? cursor.entries[cursor.entries.length - 1] : null;
 }
 
 // ============================================================================
@@ -1948,6 +1996,98 @@ const ralphCodexPlugin = {
       },
     });
 
+    // ralph_cursor - timestamp bookmarks for scoping log/transcript searches
+    api.registerTool({
+      name: "ralph_cursor",
+      label: "Ralph Cursor",
+      description: "Manage timestamp cursors for scoping log searches. Set a cursor after applying fixes, then use it to search only recent sessions/events.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", description: "Action: 'set' (create new cursor), 'get' (get last cursor), 'list' (list all cursors), 'since' (get epoch ms of last cursor for use in filters)" },
+          label: { type: "string", description: "Label for the cursor (required for 'set')" },
+          details: { type: "string", description: "Optional details about what was fixed/changed" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const action = params.action as string;
+
+        if (action === "set") {
+          const label = params.label as string;
+          if (!label) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: "Label required for 'set' action" }) }] };
+          }
+          const entry = writeCursorEntry(label, params.details as string | undefined);
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                message: "Cursor set",
+                cursor: entry,
+                hint: `Search logs since: ${entry.timestamp} (epoch: ${entry.epoch})`,
+              }, null, 2),
+            }],
+          };
+        }
+
+        if (action === "get") {
+          const last = getLastCursor();
+          if (!last) {
+            return { content: [{ type: "text", text: JSON.stringify({ message: "No cursors set yet" }) }] };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                cursor: last,
+                sinceHuman: `${Math.round((Date.now() - last.epoch) / 60000)} minutes ago`,
+                hint: `Use epoch ${last.epoch} to filter events/sessions after this point`,
+              }, null, 2),
+            }],
+          };
+        }
+
+        if (action === "since") {
+          const last = getLastCursor();
+          if (!last) {
+            return { content: [{ type: "text", text: JSON.stringify({ epoch: 0, message: "No cursor set — returning epoch 0 (search everything)" }) }] };
+          }
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                epoch: last.epoch,
+                timestamp: last.timestamp,
+                label: last.label,
+              }, null, 2),
+            }],
+          };
+        }
+
+        if (action === "list") {
+          const cursor = readCursor();
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                count: cursor.entries.length,
+                entries: cursor.entries.map((e) => ({
+                  timestamp: e.timestamp,
+                  label: e.label,
+                  details: e.details,
+                  ago: `${Math.round((Date.now() - e.epoch) / 60000)}m`,
+                })),
+              }, null, 2),
+            }],
+          };
+        }
+
+        return { content: [{ type: "text", text: JSON.stringify({ error: `Unknown action: ${action}. Use set, get, list, or since.` }) }] };
+      },
+    });
+
     // ========================================================================
     // Session Tools (codexmonitor port)
     // ========================================================================
@@ -2387,7 +2527,7 @@ const ralphCodexPlugin = {
       }),
     });
 
-    console.log(`[openclaw-codex-ralph] Registered 24 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
+    console.log(`[openclaw-codex-ralph] Registered 25 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
   },
 };
 
