@@ -460,7 +460,7 @@ interface PluginConfig {
 const DEFAULT_CONFIG: PluginConfig = {
   model: "gpt-5.2-codex",
   maxIterations: 20,
-  sandbox: "workspace-write",
+  sandbox: "danger-full-access",
   autoCommit: true,
   debug: false,
 };
@@ -753,12 +753,22 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     parts.push(trimmed);
   }
 
-  parts.push(`\n## Instructions`);
-  parts.push(`1. Implement ONLY this story - nothing more`);
-  parts.push(`2. Make minimal, focused changes`);
-  parts.push(`3. Ensure the validation command passes`);
-  parts.push(`4. Do not modify prd.json or progress.txt directly`);
-  parts.push(`5. When done, summarize what you changed and any learnings`);
+  parts.push(`\n## RULES (non-negotiable)
+
+1. **TDD is the law** — Write failing tests FIRST, then implement. No exceptions.
+2. **Implement ONLY this story** — No scope creep, no drive-by refactors.
+3. **Validation MUST pass** — Run the validation command. If it fails, fix it.
+4. **Do NOT modify** prd.json, progress.txt, or .ralph-context.json.
+5. **Store learnings in hivemind** — After completing work, run:
+   \`swarm memory store "<what you learned>" --tags "ralph,learning,${prd.projectName}"\`
+   "Learnings: None" is NEVER acceptable. You learned something. Write it down.
+6. **Report progress** — After completing work, run:
+   \`openclaw system event --mode now --text "Ralph: completed ${story.title}"\`
+7. **Your summary MUST include:**
+   - Files modified and why
+   - Tests added/modified
+   - What you learned (specific, not "None")
+   - Any gotchas for the next iteration`);
 
   return parts.join("\n");
 }
@@ -809,7 +819,10 @@ async function runCodexIteration(
 
     const child = spawn("codex", args, {
       cwd: resolvedWorkdir,
-      env: process.env,
+      env: {
+        ...process.env,
+        PATH: `${process.env.HOME}/.bun/bin:${process.env.HOME}/.local/bin:${process.env.PATH}`,
+      },
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -1133,7 +1146,14 @@ async function executeRalphIterate(
       `Validation: ${story.validationCommand || "default"}`,
       `Summary: ${codexResult.finalMessage.slice(0, 800)}`,
     ].join("\n");
-    appendProgress(workdir, progressEntry);
+    // Check for lazy learning patterns
+    const lazyLearningPattern = /learnings?:\s*(\n\s*-\s*)?none/i;
+    if (lazyLearningPattern.test(codexResult.finalMessage)) {
+      console.warn(`[openclaw-codex-ralph] ⚠️ Agent reported no learnings for: ${story.title}`);
+      appendProgress(workdir, progressEntry + "\n⚠️ Agent reported no learnings — this is tracked as a laziness pattern");
+    } else {
+      appendProgress(workdir, progressEntry);
+    }
 
     // Git commit
     if (cfg.autoCommit) {
@@ -1658,7 +1678,7 @@ const ralphCodexPlugin = {
     properties: {
       model: { type: "string", default: "o3" },
       maxIterations: { type: "number", default: 20 },
-      sandbox: { type: "string", default: "workspace-write" },
+      sandbox: { type: "string", default: "danger-full-access" },
       autoCommit: { type: "boolean", default: true },
       debug: { type: "boolean", default: false },
     },
