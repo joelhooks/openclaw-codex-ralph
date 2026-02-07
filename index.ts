@@ -852,7 +852,6 @@ async function runCodexIteration(
 
     const args = [
       "exec",
-      "-a", "never",
       "--sandbox", cfg.sandbox,
       "--json",
       "-o", outputFile,
