@@ -408,3 +408,49 @@ In addition to `progress.txt` (human-readable), Ralph maintains `.ralph-context.
 ```
 
 This structured context is automatically included in iteration prompts, giving Codex awareness of recent successes and failure patterns.
+
+---
+
+## Progress Reporting via OpenClaw Messaging
+
+**Workers MUST report progress to the coordinator in real-time using OpenClaw CLI.**
+
+This keeps the human (and coordinator agent) informed without waiting for commits or loop completion.
+
+### Required Messages
+
+```bash
+# Starting a story
+openclaw message "🚀 Starting: [story-id] - [title]"
+
+# Story completed successfully
+openclaw message "✅ Completed: [story-id] - [brief summary of changes]"
+
+# Hit a blocker
+openclaw message "🚫 Blocked: [story-id] - [what's blocking and why]"
+
+# Tests failing
+openclaw message "❌ Tests failing: [story-id] - [failure summary]"
+
+# Need human input
+openclaw message "🙋 Need input: [story-id] - [question for human]"
+```
+
+### Why This Matters
+
+1. **Real-time visibility** — Don't wait for loop completion to know what's happening
+2. **Early blocker detection** — Coordinator can intervene before wasting iterations
+3. **Human-in-the-loop** — Easy to ask questions or flag issues
+4. **Audit trail** — Messages persist in chat history
+
+### Example Flow
+
+```
+🚀 Starting: gh-24 - Install Vitest and create root config
+✅ Completed: gh-24 - Added vitest 3.0, created vitest.config.ts with coverage
+🚀 Starting: gh-25 - Create first unit test for identity.ts
+❌ Tests failing: gh-25 - identity.ts has no exports, need to check module structure
+🙋 Need input: gh-25 - Should identity.ts export a class or functions?
+```
+
+**Don't commit silently — communicate!**
