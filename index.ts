@@ -852,7 +852,7 @@ async function runCodexIteration(
 
     const args = [
       "exec",
-      "--full-auto",
+      "-a", "never",
       "--sandbox", cfg.sandbox,
       "--json",
       "-o", outputFile,
