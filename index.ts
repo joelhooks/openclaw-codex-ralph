@@ -1578,6 +1578,18 @@ async function executeRalphLoopAsync(
         });
 
         emitLoopProgress(job, "iteration");
+
+        // Send openclaw system event for real-time monitoring
+        try {
+          const summarySnippet = codexResult.finalMessage.slice(0, 200).replace(/"/g, '\\"').replace(/\n/g, ' ');
+          const commitRef = iterResult.commitHash ? ` (${iterResult.commitHash})` : '';
+          const msg = `✅ Story complete: ${story.title}${commitRef} — ${summarySnippet}`;
+          execSync(`openclaw system event --mode now --text "${msg}"`, {
+            encoding: "utf-8",
+            timeout: 10000,
+            stdio: "pipe",
+          });
+        } catch { /* non-fatal — don't block loop on notification failure */ }
       } else {
         const failureCategory = categorizeFailure(validation.output);
         const failEntry = [
@@ -1617,6 +1629,16 @@ async function executeRalphLoopAsync(
           duration: iterResult.duration,
           workdir,
         });
+
+        // Send openclaw system event for failure
+        try {
+          const msg = `❌ Story failed: ${story.title} [${failureCategory}]`;
+          execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
+            encoding: "utf-8",
+            timeout: 10000,
+            stdio: "pipe",
+          });
+        } catch { /* non-fatal */ }
 
         if (stopOnFailure) {
           job.status = "failed";
@@ -1660,6 +1682,19 @@ async function executeRalphLoopAsync(
     });
 
     emitLoopProgress(job, "complete");
+
+    // Send openclaw system event for loop completion
+    try {
+      const passed = job.results.filter(r => r.success).length;
+      const failed = job.results.filter(r => !r.success).length;
+      const elapsed = Math.round((Date.now() - job.startedAt) / 1000);
+      const msg = `🏁 Ralph loop complete: ${passed} passed, ${failed} failed, ${elapsed}s elapsed. ${remaining === 0 ? 'All stories done!' : `${remaining} stories remaining.`}`;
+      execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
+        encoding: "utf-8",
+        timeout: 10000,
+        stdio: "pipe",
+      });
+    } catch { /* non-fatal */ }
 
   } catch (err) {
     job.status = "failed";
