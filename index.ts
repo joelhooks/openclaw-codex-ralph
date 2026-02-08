@@ -10,9 +10,10 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emitDiagnosticEvent } from "openclaw/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, statSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, statSync, appendFileSync } from "fs";
 import { join, resolve, basename } from "path";
 import { homedir } from "os";
+import { createHash } from "crypto";
 import { autopsyTools } from "./autopsy.js";
 
 // ============================================================================
@@ -151,6 +152,8 @@ function emitLoopProgress(job: LoopJob, event: "start" | "iteration" | "complete
 
 const RALPH_EVENTS_DIR = join(homedir(), ".openclaw", "ralph-events");
 const RALPH_CURSOR_FILE = join(homedir(), ".openclaw", "ralph-cursor.json");
+const RALPH_ITERATIONS_DIR = join(homedir(), ".openclaw", "ralph-iterations");
+const RALPH_PROMPTS_DIR = join(RALPH_ITERATIONS_DIR, "prompts");
 
 interface RalphEvent {
   timestamp: string;
@@ -169,6 +172,7 @@ interface RalphEvent {
   storiesCompleted?: number;
   lastStory?: { id: string; title: string };
   results?: Array<{ storyTitle: string; success: boolean; duration: number }>;
+  codexSessionId?: string;
 }
 
 function writeRalphEvent(type: string, data: Partial<RalphEvent> & { jobId: string }): void {
@@ -196,6 +200,141 @@ function cleanupOldEvents(maxAgeMs: number = 86400000): void {
     const files = readdirSync(RALPH_EVENTS_DIR);
     for (const file of files) {
       const filePath = join(RALPH_EVENTS_DIR, file);
+      try {
+        const stat = statSync(filePath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          unlinkSync(filePath);
+        }
+      } catch {
+        // skip files we can't stat/delete
+      }
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+// ============================================================================
+// Iteration Log (per-project JSONL + centralized prompt persistence)
+// ============================================================================
+
+interface IterationLogEntry {
+  timestamp: string;
+  epoch: number;
+  jobId: string;
+  iterationNumber: number;
+  storyId: string;
+  storyTitle: string;
+  codexSessionId?: string;
+  codexSessionFile?: string;
+  commitHash?: string;
+  promptHash: string;
+  promptFile: string;
+  promptLength: number;
+  success: boolean;
+  validationPassed: boolean;
+  failureCategory?: FailureCategory;
+  duration: number;
+  codexOutputLength: number;
+  codexFinalMessageLength: number;
+  toolCalls: number;
+  toolNames: string[];
+  filesModified: string[];
+  validationOutput?: string;
+  model: string;
+  sandbox: string;
+}
+
+function persistPrompt(jobId: string, storyId: string, prompt: string): { path: string; hash: string } {
+  try {
+    mkdirSync(RALPH_PROMPTS_DIR, { recursive: true });
+    const hash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+    const filename = `${Date.now()}-${jobId}-${storyId}.md`;
+    const filepath = join(RALPH_PROMPTS_DIR, filename);
+    writeFileSync(filepath, prompt);
+    return { path: filepath, hash };
+  } catch (err) {
+    console.error(`[openclaw-codex-ralph] Failed to persist prompt: ${err}`);
+    return { path: "", hash: "" };
+  }
+}
+
+function appendIterationLog(workdir: string, entry: IterationLogEntry): void {
+  try {
+    const logPath = join(resolvePath(workdir), ".ralph-iterations.jsonl");
+    appendFileSync(logPath, JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.error(`[openclaw-codex-ralph] Failed to append iteration log: ${err}`);
+  }
+}
+
+function readIterationLog(
+  workdir: string,
+  options?: { sinceEpoch?: number; storyId?: string; jobId?: string; limit?: number; onlyFailed?: boolean }
+): IterationLogEntry[] {
+  const logPath = join(resolvePath(workdir), ".ralph-iterations.jsonl");
+  if (!existsSync(logPath)) return [];
+
+  try {
+    const lines = readFileSync(logPath, "utf-8").split("\n").filter((l) => l.trim());
+    let entries: IterationLogEntry[] = [];
+
+    for (const line of lines) {
+      try {
+        entries.push(JSON.parse(line) as IterationLogEntry);
+      } catch {
+        // skip malformed lines
+      }
+    }
+
+    if (options?.sinceEpoch) {
+      entries = entries.filter((e) => e.epoch >= options.sinceEpoch!);
+    }
+    if (options?.storyId) {
+      entries = entries.filter((e) => e.storyId === options.storyId);
+    }
+    if (options?.jobId) {
+      entries = entries.filter((e) => e.jobId === options.jobId);
+    }
+    if (options?.onlyFailed) {
+      entries = entries.filter((e) => !e.success);
+    }
+
+    const limit = options?.limit ?? 20;
+    return entries.slice(-limit);
+  } catch {
+    return [];
+  }
+}
+
+function resolveSessionFile(sessionId: string): string | undefined {
+  if (!sessionId) return undefined;
+  try {
+    const sessions = listSessions(undefined, 100);
+    const match = sessions.find((s) => s.id === sessionId || s.id.startsWith(sessionId));
+    return match?.file;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractToolNames(events: CodexEvent[]): string[] {
+  const names = new Set<string>();
+  for (const event of events) {
+    if ((event.type === "tool_call" || event.type === "function_call") && event.tool) {
+      names.add(event.tool);
+    }
+  }
+  return [...names];
+}
+
+function cleanupOldPrompts(maxAgeMs: number = 7 * 86400000): void {
+  try {
+    if (!existsSync(RALPH_PROMPTS_DIR)) return;
+    const now = Date.now();
+    const files = readdirSync(RALPH_PROMPTS_DIR);
+    for (const file of files) {
+      const filePath = join(RALPH_PROMPTS_DIR, file);
       try {
         const stat = statSync(filePath);
         if (now - stat.mtimeMs > maxAgeMs) {
@@ -287,8 +426,10 @@ interface RalphContextStory {
 
 interface RalphContextFailure {
   storyId: string;
+  storyTitle?: string;
   category: FailureCategory;
   error: string;
+  toolNames?: string[];
 }
 
 interface RalphContext {
@@ -339,25 +480,87 @@ function buildStructuredContextSnippet(workdir: string): string {
 
   const parts: string[] = [];
 
-  // Recent completed stories (last 5)
-  const completed = ctx.stories.filter((s) => s.status === "completed").slice(-5);
+  // Add failure category frequencies
+  const catCounts: Record<string, number> = {};
+  for (const f of ctx.failures) {
+    catCounts[f.category] = (catCounts[f.category] || 0) + 1;
+  }
+  const catSummary = Object.entries(catCounts).map(([k, v]) => `${k}: ${v}`).join(", ");
+  if (catSummary) {
+    parts.unshift("Failure frequency: " + catSummary);
+  }
+
+  // Recent completed stories (last 10)
+  const completed = ctx.stories.filter((s) => s.status === "completed").slice(-10);
   if (completed.length > 0) {
     parts.push("Recent completions:");
     for (const s of completed) {
-      parts.push(`  - ${s.title}: ${s.learnings.slice(0, 200)}`);
+      parts.push(`  - ${s.title}: ${s.learnings.slice(0, 500)}`);
     }
   }
 
-  // Recent failures (last 5)
-  const failures = ctx.failures.slice(-5);
+  // Recent failures (last 10)
+  const failures = ctx.failures.slice(-10);
   if (failures.length > 0) {
     parts.push("Recent failures:");
     for (const f of failures) {
-      parts.push(`  - [${f.category}] Story ${f.storyId}: ${f.error.slice(0, 150)}`);
+      parts.push(`  - [${f.category}] Story ${f.storyId}: ${f.error.slice(0, 400)}`);
     }
   }
 
   return parts.join("\n");
+}
+
+function buildFailurePatternContext(workdir: string): string {
+  const entries = readIterationLog(workdir, { onlyFailed: true, limit: 20 });
+  if (entries.length === 0) return "";
+
+  const parts: string[] = [];
+
+  // Group by failure category
+  const byCategory: Record<string, IterationLogEntry[]> = {};
+  for (const entry of entries) {
+    const cat = entry.failureCategory || "unknown";
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat]!.push(entry);
+  }
+
+  // Generate escalation blocks for categories with 2+ occurrences
+  for (const [category, failures] of Object.entries(byCategory)) {
+    if (failures.length >= 2) {
+      const stories = [...new Set(failures.map((f) => f.storyTitle))].slice(0, 5);
+      const tools = [...new Set(failures.flatMap((f) => f.toolNames))].slice(0, 10);
+      const lastError = failures[failures.length - 1]?.validationOutput?.slice(0, 300) || "no output captured";
+
+      parts.push([
+        `⚠️ REPEATED FAILURE: ${category} (${failures.length} occurrences)`,
+        `  Stories affected: ${stories.join(", ")}`,
+        `  Tools used: ${tools.join(", ") || "unknown"}`,
+        `  Last error: ${lastError}`,
+        `  ACTION REQUIRED: This pattern is recurring. Address the ROOT CAUSE, not just the symptom.`,
+      ].join("\n"));
+    }
+  }
+
+  // Tool frequency analysis: what tools do failed iterations use?
+  const failedToolFreq: Record<string, number> = {};
+  for (const entry of entries) {
+    for (const tool of entry.toolNames) {
+      failedToolFreq[tool] = (failedToolFreq[tool] || 0) + 1;
+    }
+  }
+
+  const topFailTools = Object.entries(failedToolFreq)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([tool, count]) => `${tool} (${count}x)`);
+
+  if (topFailTools.length > 0) {
+    parts.push(`Tools in failed iterations: ${topFailTools.join(", ")}`);
+  }
+
+  const result = parts.join("\n\n");
+  return result.length > 2000 ? result.slice(0, 2000) + "\n..." : result;
 }
 
 /**
@@ -458,6 +661,35 @@ function hivemindFind(query: string, limit: number = 3): string {
   } catch {
     return "";
   }
+}
+
+/**
+ * Aggressively pulls context from hivemind using multiple targeted queries.
+ * Returns structured sections of learnings, failures, and gotchas.
+ */
+function aggressiveHivemindPull(story: Story, prd: PRD, workdir: string): string {
+  const parts: string[] = [];
+
+  // Query 1: Direct story relevance (5 results)
+  const storyContext = hivemindFind(story.title, 5);
+  if (storyContext) parts.push("### Story-Relevant Learnings\n" + storyContext);
+
+  // Query 2: Project failure patterns (5 results)
+  const failureContext = hivemindFind(`ralph failure ${prd.projectName}`, 5);
+  if (failureContext) parts.push("### Prior Failure Patterns\n" + failureContext);
+
+  // Query 3: Project-specific learnings (3 results)
+  const projectContext = hivemindFind(`ralph learning ${prd.projectName}`, 3);
+  if (projectContext) parts.push("### Project Learnings\n" + projectContext);
+
+  // Query 4: Technology-specific gotchas based on story description keywords
+  const descWords = story.description.split(/\s+/).slice(0, 5).join(" ");
+  const techContext = hivemindFind(`${descWords} gotcha`, 3);
+  if (techContext) parts.push("### Technology Gotchas\n" + techContext);
+
+  const combined = parts.join("\n\n");
+  // Cap at 3000 chars to avoid context bloat
+  return combined.length > 3000 ? combined.slice(0, 3000) + "\n..." : combined;
 }
 
 // ============================================================================
@@ -755,7 +987,7 @@ function gitCommit(workdir: string, message: string): string | null {
   }
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -794,6 +1026,10 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     parts.push(structuredContext);
   }
 
+  if (failurePatternContext) {
+    parts.push(`\n## Failure Pattern Analysis (from iteration log)\nThese patterns have been detected across recent iterations. You MUST acknowledge and address them.\n` + failurePatternContext);
+  }
+
   if (hivemindContext) {
     parts.push(`\n## Prior Learnings (from hivemind)`);
     // Trim to avoid context bloat
@@ -806,19 +1042,106 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
 1. **TDD is the law** — Write failing tests FIRST, then implement. No exceptions.
 2. **Implement ONLY this story** — No scope creep, no drive-by refactors.
 3. **Validation MUST pass** — Run the validation command. If it fails, fix it.
-4. **Do NOT modify** prd.json, progress.txt, or .ralph-context.json.
-5. **Store learnings in hivemind** — After completing work, run:
-   \`swarm memory store "<what you learned>" --tags "ralph,learning,${prd.projectName}"\`
-   "Learnings: None" is NEVER acceptable. You learned something. Write it down.
-6. **Report progress** — After completing work, run:
+4. **Do NOT modify** prd.json, progress.txt, .ralph-context.json, or .ralph-iterations.jsonl.
+5. **MANDATORY: Review Prior Learnings** — Read the "Prior Learnings" section above BEFORE writing any code.
+   If a failure pattern matches your current story, explicitly state: "Prior failure pattern detected: [pattern]. Mitigation: [your approach]."
+6. **MANDATORY: Store learnings in hivemind** — After completing work, run:
+   \`swarm memory store "<specific, actionable learning>" --tags "ralph,learning,${prd.projectName}"\`
+
+   QUALITY REQUIREMENTS for learnings:
+   - Minimum 50 characters of substantive content
+   - Must reference specific files, types, or patterns
+   - Bad: "learned about types" or "None" or "N/A"
+   - Good: "UserProfile type requires optional email when source is OAuth — fixes TS2322 on auth.ts:45"
+   - Good: "The validation command exits non-zero on warnings, not just errors — use --quiet flag"
+
+   Your iteration WILL BE FLAGGED as low-quality if learnings are vague or missing.
+7. **Report progress** — After completing work, run:
    \`openclaw system event --mode now --text "Ralph: completed ${story.title}"\`
-7. **Your summary MUST include:**
-   - Files modified and why
-   - Tests added/modified
-   - What you learned (specific, not "None")
-   - Any gotchas for the next iteration`);
+8. **Your summary MUST include a structured learnings block:**
+   \`\`\`
+   ## Learnings
+   ### Technical Discovery
+   <what you discovered about the codebase, types, APIs>
+   ### Gotcha for Next Iteration
+   <specific pitfalls the next agent should avoid>
+   ### Files Context
+   <which files matter and why, for the next story>
+   \`\`\`
+   Every section must have substantive content. "None" is NEVER acceptable.`);
 
   return parts.join("\n");
+}
+
+interface LearningValidation {
+  valid: boolean;
+  reason?: string;
+  extractedLearnings: string;
+}
+
+function validateLearnings(finalMessage: string): LearningValidation {
+  // Check for lazy patterns
+  const lazyPatterns = [
+    /learnings?:\s*(\n\s*-\s*)?none/i,
+    /nothing\s*(new|notable|to\s*report)/i,
+    /no\s*(new\s*)?learnings/i,
+    /learnings?:\s*n\/a/i,
+    /learnings?:\s*-?\s*$/im,
+    /##\s*learnings?\s*\n\s*(none|n\/a|\s*$)/im,
+  ];
+
+  for (const pattern of lazyPatterns) {
+    if (pattern.test(finalMessage)) {
+      return { valid: false, reason: "Lazy learning pattern detected", extractedLearnings: "" };
+    }
+  }
+
+  // Extract structured learnings
+  const extracted = extractStructuredLearnings(finalMessage);
+
+  // Check minimum quality: at least 50 chars of learning content
+  if (extracted.length < 50) {
+    return { valid: false, reason: `Learning content too short (${extracted.length} chars, minimum 50)`, extractedLearnings: extracted };
+  }
+
+  return { valid: true, extractedLearnings: extracted };
+}
+
+function extractStructuredLearnings(finalMessage: string): string {
+  // Try to find structured learning sections
+  const sectionPatterns = [
+    /## Learnings\s*\n([\s\S]*?)(?=\n## [^#]|\n---|\Z)/i,
+    /### Technical Discovery\s*\n([\s\S]*?)(?=\n### |\n## |\n---|\Z)/i,
+    /### Gotcha[s]? for Next Iteration\s*\n([\s\S]*?)(?=\n### |\n## |\n---|\Z)/i,
+    /### Files Context\s*\n([\s\S]*?)(?=\n### |\n## |\n---|\Z)/i,
+  ];
+
+  const parts: string[] = [];
+  for (const pattern of sectionPatterns) {
+    const match = finalMessage.match(pattern);
+    if (match && match[1]?.trim()) {
+      parts.push(match[1].trim());
+    }
+  }
+
+  if (parts.length > 0) {
+    return parts.join("\n");
+  }
+
+  // Fallback: look for anything after common learning markers
+  const fallbackPatterns = [
+    /learnings?:\s*\n?([\s\S]{50,}?)(?=\n## |\n---|\n\n\n)/i,
+    /(?:what i learned|key takeaway|lesson)s?:\s*\n?([\s\S]{50,}?)(?=\n## |\n---|\n\n\n)/i,
+  ];
+
+  for (const pattern of fallbackPatterns) {
+    const match = finalMessage.match(pattern);
+    if (match && match[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+
+  return "";
 }
 
 interface CodexEvent {
@@ -1121,7 +1444,7 @@ async function executeRalphEditStory(params: {
 async function executeRalphIterate(
   params: { workdir: string; model?: string; dryRun?: boolean },
   cfg: PluginConfig
-): Promise<IterationResult | { dryRun: true; story: { id: string; title: string }; promptLength: number; model: string; sandbox: string } | { success: true; message: string; storiesCompleted: number } | { error: string }> {
+): Promise<IterationResult | { dryRun: true; story: { id: string; title: string }; promptLength: number; promptFile: string; promptHash: string; model: string; sandbox: string } | { success: true; message: string; storiesCompleted: number } | { error: string }> {
   const workdir = params.workdir;
   const model = params.model || cfg.model;
   const dryRun = params.dryRun;
@@ -1142,16 +1465,24 @@ async function executeRalphIterate(
   const agentsMd = readAgentsMd(workdir);
 
   // Pre-iteration: query hivemind for relevant prior learnings
-  const hivemindContext = hivemindFind(story.title);
+  const hivemindContext = aggressiveHivemindPull(story, prd, workdir);
   // Read structured context from .ralph-context.json
   const structuredCtx = buildStructuredContextSnippet(workdir);
-  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined);
+  const failurePatterns = buildFailurePatternContext(workdir);
+  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined);
+
+  const iterateJobId = `iterate-${Date.now().toString(36)}`;
+
+  // Persist prompt to disk
+  const { path: promptFile, hash: promptHash } = persistPrompt(iterateJobId, story.id, prompt);
 
   if (dryRun) {
     return {
       dryRun: true,
       story: { id: story.id, title: story.title },
       promptLength: prompt.length,
+      promptFile,
+      promptHash,
       model,
       sandbox: cfg.sandbox,
     };
@@ -1175,8 +1506,6 @@ async function executeRalphIterate(
     duration: Date.now() - startTime,
   };
 
-  const iterateJobId = `iterate-${Date.now().toString(36)}`;
-
   if (result.success) {
     // Mark story as passed
     story.passes = true;
@@ -1193,11 +1522,16 @@ async function executeRalphIterate(
       `Validation: ${story.validationCommand || "default"}`,
       `Summary: ${codexResult.finalMessage.slice(0, 800)}`,
     ].join("\n");
-    // Check for lazy learning patterns
-    const lazyLearningPattern = /learnings?:\s*(\n\s*-\s*)?none/i;
-    if (lazyLearningPattern.test(codexResult.finalMessage)) {
-      console.warn(`[openclaw-codex-ralph] ⚠️ Agent reported no learnings for: ${story.title}`);
-      appendProgress(workdir, progressEntry + "\n⚠️ Agent reported no learnings — this is tracked as a laziness pattern");
+    // Validate learning quality
+    const learningCheck = validateLearnings(codexResult.finalMessage);
+    if (!learningCheck.valid) {
+      console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
+      appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
+      // Record laziness in hivemind so future iterations see the pattern
+      hivemindStore(
+        `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${learningCheck.reason}. This is a recurring quality issue — agents must provide structured learnings.`,
+        `ralph,laziness,quality,${prd.projectName}`
+      );
     } else {
       appendProgress(workdir, progressEntry);
     }
@@ -1222,7 +1556,7 @@ async function executeRalphIterate(
       title: story.title,
       status: "completed",
       filesModified: codexResult.filesModified,
-      learnings: codexResult.finalMessage.slice(0, 500),
+      learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
     });
 
     // Story complete notification
@@ -1235,6 +1569,7 @@ async function executeRalphIterate(
       duration: result.duration,
       summary: codexResult.finalMessage.slice(0, 500),
       workdir,
+      codexSessionId: codexResult.sessionId,
     });
   } else {
     // Categorize the failure
@@ -1267,8 +1602,10 @@ async function executeRalphIterate(
     });
     addContextFailure(workdir, {
       storyId: story.id,
+      storyTitle: story.title,
       category: failureCategory,
       error: validation.output.slice(0, 500),
+      toolNames: extractToolNames(codexResult.events),
     });
 
     // Story failure notification (with category)
@@ -1280,8 +1617,38 @@ async function executeRalphIterate(
       failureCategory: failureCategory,
       duration: result.duration,
       workdir,
+      codexSessionId: codexResult.sessionId,
     });
   }
+
+  // Write iteration log entry
+  const iterFailCat = result.success ? undefined : categorizeFailure(validation.output);
+  appendIterationLog(workdir, {
+    timestamp: new Date().toISOString(),
+    epoch: Date.now(),
+    jobId: iterateJobId,
+    iterationNumber: (prd.metadata?.totalIterations || 1),
+    storyId: story.id,
+    storyTitle: story.title,
+    codexSessionId: codexResult.sessionId,
+    codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
+    commitHash: result.commitHash,
+    promptHash,
+    promptFile,
+    promptLength: prompt.length,
+    success: result.success,
+    validationPassed: validation.success,
+    failureCategory: iterFailCat,
+    duration: result.duration,
+    codexOutputLength: codexResult.output.length,
+    codexFinalMessageLength: codexResult.finalMessage.length,
+    toolCalls: codexResult.toolCalls,
+    toolNames: extractToolNames(codexResult.events),
+    filesModified: codexResult.filesModified,
+    validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+    model,
+    sandbox: cfg.sandbox,
+  });
 
   return result;
 }
@@ -1327,9 +1694,13 @@ async function executeRalphLoopSync(
     const agentsMd = readAgentsMd(workdir);
 
     // Pre-iteration: query hivemind for relevant prior learnings
-    const hivemindCtx = hivemindFind(story.title);
+    const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
     const structuredCtx = buildStructuredContextSnippet(workdir);
-    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined);
+    const failurePatterns = buildFailurePatternContext(workdir);
+    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined);
+
+    const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
+    const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
 
     const startTime = Date.now();
     const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1362,6 +1733,16 @@ async function executeRalphLoopSync(
       ].join("\n");
       appendProgress(workdir, progressEntry);
 
+      // Validate learning quality
+      const syncLearningCheck = validateLearnings(codexResult.finalMessage);
+      if (!syncLearningCheck.valid) {
+        console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${syncLearningCheck.reason}`);
+        hivemindStore(
+          `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${syncLearningCheck.reason}. Agents must provide structured learnings.`,
+          `ralph,laziness,quality,${prd.projectName}`
+        );
+      }
+
       if (cfg.autoCommit) {
         const hash = gitCommit(workdir, `ralph: ${story.title}`);
         iterResult.commitHash = hash || undefined;
@@ -1381,7 +1762,7 @@ async function executeRalphLoopSync(
         title: story.title,
         status: "completed",
         filesModified: codexResult.filesModified,
-        learnings: codexResult.finalMessage.slice(0, 500),
+        learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
       });
     } else {
       const failureCategory = categorizeFailure(validation.output);
@@ -1408,16 +1789,74 @@ async function executeRalphLoopSync(
       });
       addContextFailure(workdir, {
         storyId: story.id,
+        storyTitle: story.title,
         category: failureCategory,
         error: validation.output.slice(0, 500),
+        toolNames: extractToolNames(codexResult.events),
       });
 
       if (stopOnFailure) {
+        // Write iteration log before breaking
+        appendIterationLog(workdir, {
+          timestamp: new Date().toISOString(),
+          epoch: Date.now(),
+          jobId: syncJobId,
+          iterationNumber: i + 1,
+          storyId: story.id,
+          storyTitle: story.title,
+          codexSessionId: codexResult.sessionId,
+          codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
+          commitHash: iterResult.commitHash,
+          promptHash: syncPromptHash,
+          promptFile: syncPromptFile,
+          promptLength: prompt.length,
+          success: false,
+          validationPassed: validation.success,
+          failureCategory: categorizeFailure(validation.output),
+          duration: iterResult.duration,
+          codexOutputLength: codexResult.output.length,
+          codexFinalMessageLength: codexResult.finalMessage.length,
+          toolCalls: codexResult.toolCalls,
+          toolNames: extractToolNames(codexResult.events),
+          filesModified: codexResult.filesModified,
+          validationOutput: validation.output.slice(0, 2000),
+          model,
+          sandbox: cfg.sandbox,
+        });
         loopResult.stoppedReason = "failure";
         loopResult.results.push(iterResult);
         break;
       }
     }
+
+    // Write iteration log entry
+    const syncFailCat = iterResult.success ? undefined : categorizeFailure(validation.output);
+    appendIterationLog(workdir, {
+      timestamp: new Date().toISOString(),
+      epoch: Date.now(),
+      jobId: syncJobId,
+      iterationNumber: i + 1,
+      storyId: story.id,
+      storyTitle: story.title,
+      codexSessionId: codexResult.sessionId,
+      codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
+      commitHash: iterResult.commitHash,
+      promptHash: syncPromptHash,
+      promptFile: syncPromptFile,
+      promptLength: prompt.length,
+      success: iterResult.success,
+      validationPassed: validation.success,
+      failureCategory: syncFailCat,
+      duration: iterResult.duration,
+      codexOutputLength: codexResult.output.length,
+      codexFinalMessageLength: codexResult.finalMessage.length,
+      toolCalls: codexResult.toolCalls,
+      toolNames: extractToolNames(codexResult.events),
+      filesModified: codexResult.filesModified,
+      validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+      model,
+      sandbox: cfg.sandbox,
+    });
 
     loopResult.results.push(iterResult);
   }
@@ -1452,8 +1891,9 @@ async function executeRalphLoopAsync(
 
   emitLoopProgress(job, "start");
 
-  // Clean up old event files and emit loop_start
+  // Clean up old event files and prompt files, emit loop_start
   cleanupOldEvents();
+  cleanupOldPrompts();
   writeRalphEvent("loop_start", { jobId: job.id, totalStories: job.totalStories, workdir });
 
   try {
@@ -1505,9 +1945,13 @@ async function executeRalphLoopAsync(
       const agentsMd = readAgentsMd(workdir);
 
       // Pre-iteration: query hivemind for relevant prior learnings
-      const hivemindCtx = hivemindFind(story.title);
+      const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
       const structuredCtx = buildStructuredContextSnippet(workdir);
-      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined);
+      const failurePatterns = buildFailurePatternContext(workdir);
+      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined);
+
+      // Persist prompt to disk
+      const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
 
       const startTime = Date.now();
       const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
@@ -1542,6 +1986,16 @@ async function executeRalphLoopAsync(
         ].join("\n");
         appendProgress(workdir, progressEntry);
 
+        // Validate learning quality
+        const asyncLearningCheck = validateLearnings(codexResult.finalMessage);
+        if (!asyncLearningCheck.valid) {
+          console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${asyncLearningCheck.reason}`);
+          hivemindStore(
+            `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${asyncLearningCheck.reason}. Agents must provide structured learnings.`,
+            `ralph,laziness,quality,${prd.projectName}`
+          );
+        }
+
         if (cfg.autoCommit) {
           const hash = gitCommit(workdir, `ralph: ${story.title}`);
           iterResult.commitHash = hash || undefined;
@@ -1561,7 +2015,7 @@ async function executeRalphLoopAsync(
           title: story.title,
           status: "completed",
           filesModified: codexResult.filesModified,
-          learnings: codexResult.finalMessage.slice(0, 500),
+          learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
         });
 
         // Story complete notification
@@ -1574,6 +2028,7 @@ async function executeRalphLoopAsync(
           duration: iterResult.duration,
           summary: codexResult.finalMessage.slice(0, 500),
           workdir,
+          codexSessionId: codexResult.sessionId,
         });
 
         emitLoopProgress(job, "iteration");
@@ -1614,8 +2069,10 @@ async function executeRalphLoopAsync(
         });
         addContextFailure(workdir, {
           storyId: story.id,
+          storyTitle: story.title,
           category: failureCategory,
           error: validation.output.slice(0, 500),
+          toolNames: extractToolNames(codexResult.events),
         });
 
         // Story failure notification (with category)
@@ -1627,6 +2084,7 @@ async function executeRalphLoopAsync(
           failureCategory: failureCategory,
           duration: iterResult.duration,
           workdir,
+          codexSessionId: codexResult.sessionId,
         });
 
         // Send openclaw system event for failure
@@ -1640,6 +2098,33 @@ async function executeRalphLoopAsync(
         } catch { /* non-fatal */ }
 
         if (stopOnFailure) {
+          // Write iteration log before returning
+          appendIterationLog(workdir, {
+            timestamp: new Date().toISOString(),
+            epoch: Date.now(),
+            jobId: job.id,
+            iterationNumber: i + 1,
+            storyId: story.id,
+            storyTitle: story.title,
+            codexSessionId: codexResult.sessionId,
+            codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
+            commitHash: iterResult.commitHash,
+            promptHash: asyncPromptHash,
+            promptFile: asyncPromptFile,
+            promptLength: prompt.length,
+            success: false,
+            validationPassed: validation.success,
+            failureCategory,
+            duration: iterResult.duration,
+            codexOutputLength: codexResult.output.length,
+            codexFinalMessageLength: codexResult.finalMessage.length,
+            toolCalls: codexResult.toolCalls,
+            toolNames: extractToolNames(codexResult.events),
+            filesModified: codexResult.filesModified,
+            validationOutput: validation.output.slice(0, 2000),
+            model: loopCfg.model,
+            sandbox: cfg.sandbox,
+          });
           job.status = "failed";
           job.error = `Story failed: ${story.title}`;
           job.completedAt = Date.now();
@@ -1656,6 +2141,35 @@ async function executeRalphLoopAsync(
 
         emitLoopProgress(job, "iteration");
       }
+
+      // Write iteration log entry
+      const asyncFailCat = iterResult.success ? undefined : categorizeFailure(validation.output);
+      appendIterationLog(workdir, {
+        timestamp: new Date().toISOString(),
+        epoch: Date.now(),
+        jobId: job.id,
+        iterationNumber: i + 1,
+        storyId: story.id,
+        storyTitle: story.title,
+        codexSessionId: codexResult.sessionId,
+        codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
+        commitHash: iterResult.commitHash,
+        promptHash: asyncPromptHash,
+        promptFile: asyncPromptFile,
+        promptLength: prompt.length,
+        success: iterResult.success,
+        validationPassed: validation.success,
+        failureCategory: asyncFailCat,
+        duration: iterResult.duration,
+        codexOutputLength: codexResult.output.length,
+        codexFinalMessageLength: codexResult.finalMessage.length,
+        toolCalls: codexResult.toolCalls,
+        toolNames: extractToolNames(codexResult.events),
+        filesModified: codexResult.filesModified,
+        validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+        model: loopCfg.model,
+        sandbox: cfg.sandbox,
+      });
     }
 
     // Reached max iterations
@@ -2561,7 +3075,112 @@ const ralphCodexPlugin = {
       }),
     });
 
-    console.log(`[openclaw-codex-ralph] Registered 25 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
+    // ========================================================================
+    // Iteration Log Browser
+    // ========================================================================
+
+    api.registerTool({
+      name: "ralph_iterations",
+      label: "Ralph Iterations",
+      description: "Browse iteration history for a project. Shows timing, tool names, prompt hashes, session cross-references. Use showPrompt to retrieve full prompt text.",
+      parameters: {
+        type: "object",
+        properties: {
+          workdir: { type: "string", description: "Project directory (required)" },
+          limit: { type: "number", description: "Max entries to return (default: 20)" },
+          onlyFailed: { type: "boolean", description: "Only show failed iterations" },
+          sinceEpoch: { type: "number", description: "Only show iterations after this epoch (ms)" },
+          storyId: { type: "string", description: "Filter by story ID" },
+          jobId: { type: "string", description: "Filter by job ID" },
+          showPrompt: { type: "string", description: "Story ID — retrieve the most recent persisted prompt for this story" },
+        },
+        required: ["workdir"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const workdir = params.workdir as string;
+
+        // showPrompt mode: retrieve full prompt text for a story
+        if (params.showPrompt) {
+          const storyId = params.showPrompt as string;
+          const entries = readIterationLog(workdir, { storyId, limit: 1 });
+          if (entries.length === 0) {
+            return { content: [{ type: "text", text: JSON.stringify({ error: `No iterations found for story: ${storyId}` }) }] };
+          }
+          const entry = entries[entries.length - 1]!;
+          let promptText = "";
+          try {
+            if (entry.promptFile && existsSync(entry.promptFile)) {
+              promptText = readFileSync(entry.promptFile, "utf-8");
+            } else {
+              promptText = `[Prompt file not found: ${entry.promptFile}]`;
+            }
+          } catch {
+            promptText = `[Error reading prompt file: ${entry.promptFile}]`;
+          }
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                storyId: entry.storyId,
+                storyTitle: entry.storyTitle,
+                promptHash: entry.promptHash,
+                promptFile: entry.promptFile,
+                promptLength: entry.promptLength,
+                timestamp: entry.timestamp,
+                prompt: promptText,
+              }, null, 2),
+            }],
+          };
+        }
+
+        // Browse mode: list iteration entries with filters
+        const entries = readIterationLog(workdir, {
+          limit: (params.limit as number) || 20,
+          onlyFailed: params.onlyFailed as boolean | undefined,
+          sinceEpoch: params.sinceEpoch as number | undefined,
+          storyId: params.storyId as string | undefined,
+          jobId: params.jobId as string | undefined,
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              count: entries.length,
+              entries: entries.map((e) => ({
+                timestamp: e.timestamp,
+                epoch: e.epoch,
+                jobId: e.jobId,
+                iterationNumber: e.iterationNumber,
+                storyId: e.storyId,
+                storyTitle: e.storyTitle,
+                success: e.success,
+                validationPassed: e.validationPassed,
+                failureCategory: e.failureCategory,
+                duration: e.duration,
+                durationHuman: `${Math.round(e.duration / 1000)}s`,
+                promptHash: e.promptHash,
+                promptLength: e.promptLength,
+                codexSessionId: e.codexSessionId,
+                codexSessionFile: e.codexSessionFile,
+                commitHash: e.commitHash,
+                toolCalls: e.toolCalls,
+                toolNames: e.toolNames,
+                filesModified: e.filesModified,
+                codexOutputLength: e.codexOutputLength,
+                codexFinalMessageLength: e.codexFinalMessageLength,
+                validationOutput: e.validationOutput,
+                model: e.model,
+                sandbox: e.sandbox,
+              })),
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
+    console.log(`[openclaw-codex-ralph] Registered 26 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
   },
 };
 
