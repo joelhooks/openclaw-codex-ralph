@@ -21,6 +21,7 @@ import { deduplicateFailureContext } from "./prompt-helpers.js";
 import { generateCodebaseMap, enrichMapFromSession } from "./context-generator.js";
 import { processRegistry, monitorProgress, getActualFilesModified } from "./process-helpers.js";
 import { StoryRetryTracker, DEFAULT_MAX_RETRIES, shouldSkipStory, formatSkippedSummary } from "./loop-guards.js";
+import { createStderrMonitor, formatIterationBehavior, type MonitorStats } from "./loop-monitor.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -721,6 +722,10 @@ function aggressiveHivemindPull(story: Story, prd: PRD, workdir: string): string
   const techContext = hivemindFind(`${descWords} gotcha`, 3);
   if (techContext) parts.push("### Technology Gotchas\n" + techContext);
 
+  // Query 5: Recent iteration behavior insights (how did the last agent perform?)
+  const behaviorContext = hivemindFind(`ralph session-insight ${prd.projectName}`, 2);
+  if (behaviorContext) parts.push("### Recent Iteration Behavior\n" + behaviorContext);
+
   const combined = parts.join("\n\n");
   // Cap at 3000 chars to avoid context bloat
   return combined.length > 3000 ? combined.slice(0, 3000) + "\n..." : combined;
@@ -1091,7 +1096,7 @@ function buildPreviousAttemptContext(workdir: string, storyId: string): string {
   return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string, previousBehavior?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1151,6 +1156,10 @@ ${previousAttemptContext}`);
     parts.push(trimmed);
   }
 
+  if (previousBehavior) {
+    parts.push(`\n${previousBehavior}`);
+  }
+
   parts.push(`\n## RULES (non-negotiable)
 
 1. **TDD is the law** — Write failing tests FIRST, then implement. No exceptions.
@@ -1182,7 +1191,13 @@ ${previousAttemptContext}`);
    ### Files Context
    <which files matter and why, for the next story>
    \`\`\`
-   Every section must have substantive content. "None" is NEVER acceptable.`);
+   Every section must have substantive content. "None" is NEVER acceptable.
+9. **TRUST AND ENRICH THE CODEBASE MAP** — The Codebase Reference above has your file tree, types, and imports.
+   Do NOT spend time re-exploring with cat/rg/find for files already listed above.
+   If the codebase map covers your area, go straight to writing a failing test.
+   If you discover new types, files, or patterns NOT in the map, note them in your learnings so the map can be enriched.
+10. **USE HIVEMIND** — Before implementing, run: \`swarm memory find "<your story topic>"\`
+    After completing, run: \`swarm memory store "<specific learning>" --tags "ralph,learning,${prd.projectName}"\``);
 
   return parts.join("\n");
 }
@@ -1309,6 +1324,8 @@ interface CodexIterationResult {
   toolCalls: number;
   filesModified: string[];
   sessionId?: string;
+  stderrInsights?: string;
+  stderrStats?: MonitorStats;
 }
 
 function parseCodexOutput(stdout: string, outputFile: string): {
@@ -1434,6 +1451,8 @@ async function runCodexIteration(
       },
     });
 
+    const stderrMonitor = createStderrMonitor(child.stderr!);
+
     let stdout = "";
     let stderr = "";
 
@@ -1447,6 +1466,7 @@ async function runCodexIteration(
 
     child.on("close", (code: number | null) => {
       progressMonitor.cancel();
+      stderrMonitor.stop();
       const parsed = parseCodexOutput(stdout, outputFile);
       const output = parsed.finalMessage || stdout.slice(0, 5000);
 
@@ -1462,6 +1482,8 @@ async function runCodexIteration(
         toolCalls: parsed.toolCalls,
         filesModified: allFilesModified,
         sessionId: parsed.sessionId,
+        stderrInsights: stderrMonitor.getInsights(),
+        stderrStats: stderrMonitor.getStats(),
       });
     });
 
@@ -1480,6 +1502,7 @@ async function runCodexIteration(
     // Timeout after 10 minutes — preserve partial data from accumulated stdout
     setTimeout(() => {
       progressMonitor.cancel();
+      stderrMonitor.stop();
       child.kill("SIGTERM");
       const partial = parseCodexOutput(stdout, outputFile);
       const output = "Timeout: iteration exceeded 10 minutes\n" + (partial.finalMessage || stdout.slice(0, 5000));
@@ -1493,6 +1516,8 @@ async function runCodexIteration(
         toolCalls: partial.toolCalls,
         filesModified: partial.filesModified,
         sessionId: partial.sessionId,
+        stderrInsights: stderrMonitor.getInsights(),
+        stderrStats: stderrMonitor.getStats(),
       });
     }, 600000);
   });
@@ -1760,14 +1785,31 @@ async function executeRalphIterate(
       );
     }
 
+    // Store extracted learnings in hivemind (regardless of commit — learnings are always valuable)
+    const iterateLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+    if (iterateLearnings && iterateLearnings.length >= 50) {
+      hivemindStore(
+        `Learnings from "${story.title}": ${iterateLearnings}`,
+        `ralph,success,learning,${prd.projectName},${story.id}`
+      );
+    }
+
     // Update structured context
     addContextStory(workdir, {
       id: story.id,
       title: story.title,
       status: "completed",
       filesModified: codexResult.filesModified,
-      learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
+      learnings: iterateLearnings || codexResult.finalMessage.slice(0, 500),
     });
+
+    // Store stderr insights for behavioral analysis
+    if (codexResult.stderrInsights) {
+      hivemindStore(
+        `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+        `ralph,session-insight,${prd.projectName}`
+      );
+    }
 
     // Story complete notification
     writeRalphEvent("story_complete", {
@@ -1801,6 +1843,14 @@ async function executeRalphIterate(
       `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
       `ralph,failure,${failureCategory},${prd.projectName}`
     );
+
+    // Store stderr insights on failure too — helps diagnose behavioral patterns
+    if (codexResult.stderrInsights) {
+      hivemindStore(
+        `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
+        `ralph,session-insight,failure,${prd.projectName}`
+      );
+    }
 
     // Update structured context with failure
     addContextStory(workdir, {
@@ -1885,6 +1935,8 @@ async function executeRalphLoopSync(
     stoppedReason: "complete",
   };
 
+  let lastSyncStderrStats: MonitorStats | undefined;
+
   for (let i = 0; i < maxIterations; i++) {
     const prd = readPRD(workdir);
     if (!prd) {
@@ -1914,13 +1966,15 @@ async function executeRalphLoopSync(
     const structuredCtx = buildStructuredContextSnippet(workdir);
     const failurePatterns = buildFailurePatternContext(workdir);
     const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
+    const prevBehavior = lastSyncStderrStats ? formatIterationBehavior(lastSyncStderrStats) : undefined;
+    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, prevBehavior || undefined);
 
     const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
     const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
 
     const startTime = Date.now();
     const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
+    lastSyncStderrStats = codexResult.stderrStats;
     const validation = runValidation(workdir, story.validationCommand);
 
     const iterResult: IterationResult = {
@@ -1975,14 +2029,31 @@ async function executeRalphLoopSync(
         );
       }
 
+      // Store extracted learnings in hivemind (regardless of commit)
+      const syncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+      if (syncLearnings && syncLearnings.length >= 50) {
+        hivemindStore(
+          `Learnings from "${story.title}": ${syncLearnings}`,
+          `ralph,success,learning,${prd.projectName},${story.id}`
+        );
+      }
+
       // Update structured context
       addContextStory(workdir, {
         id: story.id,
         title: story.title,
         status: "completed",
         filesModified: codexResult.filesModified,
-        learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
+        learnings: syncLearnings || codexResult.finalMessage.slice(0, 500),
       });
+
+      // Store stderr insights
+      if (codexResult.stderrInsights) {
+        hivemindStore(
+          `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+          `ralph,session-insight,${prd.projectName}`
+        );
+      }
     } else {
       const failureCategory = categorizeFailure(validation.output);
       const failEntry = [
@@ -1997,6 +2068,14 @@ async function executeRalphLoopSync(
         `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
         `ralph,failure,${failureCategory},${prd.projectName}`
       );
+
+      // Store stderr insights on failure
+      if (codexResult.stderrInsights) {
+        hivemindStore(
+          `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
+          `ralph,session-insight,failure,${prd.projectName}`
+        );
+      }
 
       // Update structured context with failure
       addContextStory(workdir, {
@@ -2116,6 +2195,8 @@ async function executeRalphLoopAsync(
   cleanupOldPrompts();
   writeRalphEvent("loop_start", { jobId: job.id, totalStories: job.totalStories, workdir });
 
+  let lastAsyncStderrStats: MonitorStats | undefined;
+
   try {
     for (let i = 0; i < maxIterations; i++) {
       // Check for cancellation
@@ -2174,13 +2255,15 @@ async function executeRalphLoopAsync(
       const structuredCtx = buildStructuredContextSnippet(workdir);
       const failurePatterns = buildFailurePatternContext(workdir);
       const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
+      const asyncPrevBehavior = lastAsyncStderrStats ? formatIterationBehavior(lastAsyncStderrStats) : undefined;
+      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, asyncPrevBehavior || undefined);
 
       // Persist prompt to disk
       const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
 
       const startTime = Date.now();
       const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
+      lastAsyncStderrStats = codexResult.stderrStats;
       const validation = runValidation(workdir, story.validationCommand);
 
       const iterResult: IterationResult = {
@@ -2236,14 +2319,31 @@ async function executeRalphLoopAsync(
           );
         }
 
+        // Store extracted learnings in hivemind (regardless of commit)
+        const asyncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+        if (asyncLearnings && asyncLearnings.length >= 50) {
+          hivemindStore(
+            `Learnings from "${story.title}": ${asyncLearnings}`,
+            `ralph,success,learning,${prd.projectName},${story.id}`
+          );
+        }
+
         // Update structured context
         addContextStory(workdir, {
           id: story.id,
           title: story.title,
           status: "completed",
           filesModified: codexResult.filesModified,
-          learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
+          learnings: asyncLearnings || codexResult.finalMessage.slice(0, 500),
         });
+
+        // Store stderr insights
+        if (codexResult.stderrInsights) {
+          hivemindStore(
+            `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+            `ralph,session-insight,${prd.projectName}`
+          );
+        }
 
         // Story complete notification
         writeRalphEvent("story_complete", {
@@ -2285,6 +2385,14 @@ async function executeRalphLoopAsync(
           `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
           `ralph,failure,${failureCategory},${prd.projectName}`
         );
+
+        // Store stderr insights on failure
+        if (codexResult.stderrInsights) {
+          hivemindStore(
+            `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
+            `ralph,session-insight,failure,${prd.projectName}`
+          );
+        }
 
         // Update structured context with failure
         addContextStory(workdir, {
