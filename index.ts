@@ -987,7 +987,89 @@ function gitCommit(workdir: string, message: string): string | null {
   }
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string): string {
+function extractActionSequence(events: SessionEvent[]): string {
+  const actions: string[] = [];
+
+  for (const event of events) {
+    if (!event.payload) continue;
+
+    // Tool/function calls — the meat of what we want
+    if (event.type === "response_item" && event.payload.type === "function_call") {
+      const name = (event.payload as Record<string, unknown>).name || (event.payload as Record<string, unknown>).call_id || "unknown_tool";
+      const args = (event.payload as Record<string, unknown>).arguments;
+      let argSummary = "";
+      if (typeof args === "string") {
+        try {
+          const parsed = JSON.parse(args);
+          if (parsed.path) argSummary = ` file=${parsed.path}`;
+          else if (parsed.command) argSummary = ` cmd="${String(parsed.command).slice(0, 100)}"`;
+          else argSummary = ` ${args.slice(0, 80)}`;
+        } catch {
+          argSummary = ` ${args.slice(0, 80)}`;
+        }
+      }
+      actions.push(`→ ${name}${argSummary}`);
+    }
+
+    // Function call outputs (errors are gold)
+    if (event.type === "response_item" && event.payload.type === "function_call_output") {
+      const output = (event.payload as Record<string, unknown>).output || "";
+      if (typeof output === "string" && (output.includes("error") || output.includes("Error") || output.includes("FAIL"))) {
+        actions.push(`  ✗ ${output.slice(0, 200)}`);
+      }
+    }
+  }
+
+  if (actions.length === 0) return "";
+
+  // Cap at ~40 actions to avoid context bloat
+  const trimmed = actions.length > 40
+    ? [...actions.slice(0, 20), `  ... (${actions.length - 40} actions omitted)`, ...actions.slice(-20)]
+    : actions;
+  return trimmed.join("\n");
+}
+
+function buildPreviousAttemptContext(workdir: string, storyId: string): string {
+  // Read iteration log for this story, get the most recent failed entries
+  const entries = readIterationLog(workdir, { storyId, onlyFailed: true, limit: 3 });
+  if (entries.length === 0) return "";
+
+  const lastFailed = entries[entries.length - 1]!;
+  const parts: string[] = [];
+
+  parts.push(`Previous attempt failed (${lastFailed.failureCategory || "unknown"}, ${Math.round(lastFailed.duration / 1000)}s)`);
+  parts.push(`Tools used: ${lastFailed.toolNames.join(", ") || "none"}`);
+  parts.push(`Files touched: ${lastFailed.filesModified.join(", ") || "none"}`);
+
+  // Try to read session transcript for granular action sequence
+  if (lastFailed.codexSessionId) {
+    const session = getSessionById(lastFailed.codexSessionId);
+    if (session) {
+      const actionLog = extractActionSequence(session.events);
+      if (actionLog) {
+        parts.push("\nAction sequence from previous attempt:");
+        parts.push(actionLog);
+      }
+    }
+  }
+
+  // Include validation output (already captured in iteration log)
+  if (lastFailed.validationOutput) {
+    parts.push("\nValidation error:");
+    parts.push(lastFailed.validationOutput.slice(0, 1000));
+  }
+
+  // If multiple failures, show the pattern
+  if (entries.length > 1) {
+    const cats = entries.map(e => e.failureCategory || "unknown");
+    parts.push(`\n⚠️ This story has failed ${entries.length} times: ${cats.join(" → ")}`);
+  }
+
+  const result = parts.join("\n");
+  return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
+}
+
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1019,6 +1101,13 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     // Only include last ~2000 chars to avoid context bloat
     const trimmedProgress = progress.length > 2000 ? "...\n" + progress.slice(-2000) : progress;
     parts.push(trimmedProgress);
+  }
+
+  if (previousAttemptContext) {
+    parts.push(`\n## Previous Attempt (CRITICAL — read this before coding)
+You are retrying a story that previously failed. Study what was tried and where it broke. Do NOT repeat the same approach if it failed — try a different strategy.
+
+${previousAttemptContext}`);
   }
 
   if (structuredContext) {
@@ -1164,6 +1253,47 @@ interface CodexIterationResult {
   sessionId?: string;
 }
 
+function parseCodexOutput(stdout: string, outputFile: string): {
+  events: CodexEvent[];
+  toolCalls: number;
+  filesModified: string[];
+  sessionId?: string;
+  finalMessage: string;
+} {
+  const events: CodexEvent[] = [];
+  const lines = stdout.split("\n").filter((l) => l.trim());
+  for (const line of lines) {
+    try { events.push(JSON.parse(line) as CodexEvent); } catch { /* skip */ }
+  }
+
+  const toolCalls = events.filter((e) => e.type === "tool_call" || e.type === "function_call").length;
+  const filesModified: string[] = [];
+  let sessionId: string | undefined;
+
+  for (const event of events) {
+    if (event.type === "session_start" || event.type === "session_meta") {
+      const payload = event as unknown as { session_id?: string; id?: string; payload?: { id?: string } };
+      sessionId = payload.session_id || payload.id || payload.payload?.id;
+    }
+    if (event.type === "tool_call" && event.tool === "write_file" && event.args?.path) {
+      filesModified.push(String(event.args.path));
+    }
+    if (event.type === "tool_call" && event.tool === "edit_file" && event.args?.path) {
+      filesModified.push(String(event.args.path));
+    }
+  }
+
+  let finalMessage = "";
+  try {
+    if (existsSync(outputFile)) {
+      finalMessage = readFileSync(outputFile, "utf-8");
+      try { execSync(`rm "${outputFile}"`, { encoding: "utf-8" }); } catch { /* ignore */ }
+    }
+  } catch { /* skip */ }
+
+  return { events, toolCalls, filesModified: [...new Set(filesModified)], sessionId, finalMessage };
+}
+
 async function runCodexIteration(
   workdir: string,
   prompt: string,
@@ -1208,60 +1338,17 @@ async function runCodexIteration(
     });
 
     child.on("close", (code: number | null) => {
-      // Parse JSONL events
-      const events: CodexEvent[] = [];
-      const lines = stdout.split("\n").filter((l) => l.trim());
-
-      for (const line of lines) {
-        try {
-          const event = JSON.parse(line) as CodexEvent;
-          events.push(event);
-        } catch {
-          // Not JSON, skip
-        }
-      }
-
-      // Extract useful info from events
-      const toolCalls = events.filter((e) => e.type === "tool_call" || e.type === "function_call").length;
-      const filesModified: string[] = [];
-      let sessionId: string | undefined;
-
-      for (const event of events) {
-        // Extract session ID from session_start or similar events
-        if (event.type === "session_start" || event.type === "session_meta") {
-          const payload = event as unknown as { session_id?: string; id?: string; payload?: { id?: string } };
-          sessionId = payload.session_id || payload.id || payload.payload?.id;
-        }
-        if (event.type === "tool_call" && event.tool === "write_file" && event.args?.path) {
-          filesModified.push(String(event.args.path));
-        }
-        if (event.type === "tool_call" && event.tool === "edit_file" && event.args?.path) {
-          filesModified.push(String(event.args.path));
-        }
-      }
-
-      // Read final message from output file
-      let finalMessage = "";
-      try {
-        if (existsSync(outputFile)) {
-          finalMessage = readFileSync(outputFile, "utf-8");
-          // Clean up temp file
-          try { execSync(`rm "${outputFile}"`, { encoding: "utf-8" }); } catch { /* ignore */ }
-        }
-      } catch {
-        finalMessage = "";
-      }
-
-      const output = finalMessage || stdout.slice(0, 5000);
+      const parsed = parseCodexOutput(stdout, outputFile);
+      const output = parsed.finalMessage || stdout.slice(0, 5000);
 
       resolve({
         success: code === 0,
         output,
-        finalMessage,
-        events,
-        toolCalls,
-        filesModified: [...new Set(filesModified)],
-        sessionId,
+        finalMessage: parsed.finalMessage,
+        events: parsed.events,
+        toolCalls: parsed.toolCalls,
+        filesModified: parsed.filesModified,
+        sessionId: parsed.sessionId,
       });
     });
 
@@ -1277,16 +1364,20 @@ async function runCodexIteration(
       });
     });
 
-    // Timeout after 10 minutes
+    // Timeout after 10 minutes — preserve partial data from accumulated stdout
     setTimeout(() => {
       child.kill("SIGTERM");
+      const partial = parseCodexOutput(stdout, outputFile);
+      const output = "Timeout: iteration exceeded 10 minutes\n" + (partial.finalMessage || stdout.slice(0, 5000));
+
       resolve({
         success: false,
-        output: "Timeout: iteration exceeded 10 minutes",
-        finalMessage: "",
-        events: [],
-        toolCalls: 0,
-        filesModified: [],
+        output,
+        finalMessage: partial.finalMessage,
+        events: partial.events,
+        toolCalls: partial.toolCalls,
+        filesModified: partial.filesModified,
+        sessionId: partial.sessionId,
       });
     }, 600000);
   });
@@ -1469,7 +1560,8 @@ async function executeRalphIterate(
   // Read structured context from .ralph-context.json
   const structuredCtx = buildStructuredContextSnippet(workdir);
   const failurePatterns = buildFailurePatternContext(workdir);
-  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined);
+  const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
+  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
   const iterateJobId = `iterate-${Date.now().toString(36)}`;
 
@@ -1697,7 +1789,8 @@ async function executeRalphLoopSync(
     const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
     const structuredCtx = buildStructuredContextSnippet(workdir);
     const failurePatterns = buildFailurePatternContext(workdir);
-    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined);
+    const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
+    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
     const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
     const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
@@ -1948,7 +2041,8 @@ async function executeRalphLoopAsync(
       const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
       const structuredCtx = buildStructuredContextSnippet(workdir);
       const failurePatterns = buildFailurePatternContext(workdir);
-      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined);
+      const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
+      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
       // Persist prompt to disk
       const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
