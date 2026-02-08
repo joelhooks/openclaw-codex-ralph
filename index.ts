@@ -683,7 +683,7 @@ function aggressiveHivemindPull(story: Story, prd: PRD, workdir: string): string
   if (projectContext) parts.push("### Project Learnings\n" + projectContext);
 
   // Query 4: Technology-specific gotchas based on story description keywords
-  const descWords = story.description.split(/\s+/).slice(0, 5).join(" ");
+  const descWords = (story.description || story.title || "").split(/\s+/).slice(0, 5).join(" ");
   const techContext = hivemindFind(`${descWords} gotcha`, 3);
   if (techContext) parts.push("### Technology Gotchas\n" + techContext);
 
