@@ -321,8 +321,21 @@ function resolveSessionFile(sessionId: string): string | undefined {
 function extractToolNames(events: CodexEvent[]): string[] {
   const names = new Set<string>();
   for (const event of events) {
-    if ((event.type === "tool_call" || event.type === "function_call") && event.tool) {
-      names.add(event.tool);
+    if (!event.item) continue;
+    if (event.type === "item.completed" || event.type === "item.started") {
+      if (event.item.type === "command_execution" && event.item.command) {
+        // Extract the base command name from the full command string
+        // e.g. '/usr/bin/zsh -lc "cd /foo && pnpm test"' → 'pnpm test'
+        const cmd = event.item.command;
+        const shellMatch = cmd.match(/-lc\s+"(?:cd\s+[^&]+&&\s*)?(.+?)"/);
+        const baseCmd = shellMatch ? shellMatch[1]! : cmd;
+        const firstWord = baseCmd.trim().split(/\s+/).slice(0, 2).join(" ");
+        names.add(firstWord);
+      } else if (event.item.type === "file_change" && event.item.path) {
+        names.add("file_change");
+      } else if (event.item.type === "mcp_tool_call") {
+        names.add("mcp_tool_call");
+      }
     }
   }
   return [...names];
@@ -991,32 +1004,40 @@ function extractActionSequence(events: SessionEvent[]): string {
   const actions: string[] = [];
 
   for (const event of events) {
-    if (!event.payload) continue;
+    // Codex session JSONL uses same wire format as --json output
+    // Try both the raw event format (CodexEvent-like) and the session format
+    const ev = event as unknown as CodexEvent;
 
-    // Tool/function calls — the meat of what we want
-    if (event.type === "response_item" && event.payload.type === "function_call") {
-      const name = (event.payload as Record<string, unknown>).name || (event.payload as Record<string, unknown>).call_id || "unknown_tool";
-      const args = (event.payload as Record<string, unknown>).arguments;
-      let argSummary = "";
-      if (typeof args === "string") {
-        try {
-          const parsed = JSON.parse(args);
-          if (parsed.path) argSummary = ` file=${parsed.path}`;
-          else if (parsed.command) argSummary = ` cmd="${String(parsed.command).slice(0, 100)}"`;
-          else argSummary = ` ${args.slice(0, 80)}`;
-        } catch {
-          argSummary = ` ${args.slice(0, 80)}`;
+    if (!ev.item) continue;
+
+    // Command executions — the meat of what we want
+    if ((ev.type === "item.completed" || ev.type === "item.started") && ev.item.type === "command_execution") {
+      const cmd = ev.item.command || "unknown";
+      // Extract the meaningful part from shell wrapper
+      const shellMatch = cmd.match(/-lc\s+"(?:cd\s+[^&]+&&\s*)?(.+?)"/);
+      const displayCmd = shellMatch ? shellMatch[1]! : cmd;
+      actions.push(`→ exec: ${displayCmd.slice(0, 120)}`);
+
+      // If completed with error output, capture it
+      if (ev.type === "item.completed" && ev.item.exit_code && ev.item.exit_code !== 0) {
+        const output = ev.item.aggregated_output || "";
+        // Get last meaningful line of error output
+        const errorLines = output.split("\n").filter(l => l.trim()).slice(-3).join(" | ");
+        if (errorLines) {
+          actions.push(`  ✗ exit=${ev.item.exit_code}: ${errorLines.slice(0, 200)}`);
         }
       }
-      actions.push(`→ ${name}${argSummary}`);
     }
 
-    // Function call outputs (errors are gold)
-    if (event.type === "response_item" && event.payload.type === "function_call_output") {
-      const output = (event.payload as Record<string, unknown>).output || "";
-      if (typeof output === "string" && (output.includes("error") || output.includes("Error") || output.includes("FAIL"))) {
-        actions.push(`  ✗ ${output.slice(0, 200)}`);
-      }
+    // File changes
+    if ((ev.type === "item.completed" || ev.type === "item.started") && ev.item.type === "file_change" && ev.item.path) {
+      actions.push(`→ write: ${ev.item.path}`);
+    }
+
+    // Reasoning steps (condensed)
+    if (ev.type === "item.completed" && ev.item.type === "reasoning" && ev.item.text) {
+      const summary = ev.item.text.split("\n")[0]?.slice(0, 100) || "";
+      if (summary) actions.push(`  💭 ${summary}`);
     }
   }
 
@@ -1234,12 +1255,24 @@ function extractStructuredLearnings(finalMessage: string): string {
 }
 
 interface CodexEvent {
-  type: string;
-  message?: string;
-  content?: string;
-  tool?: string;
-  args?: Record<string, unknown>;
-  output?: string;
+  type: string;               // thread.started, turn.started, turn.completed, item.started, item.completed, error
+  thread_id?: string;         // on thread.started
+  item?: {
+    id?: string;
+    type?: string;            // command_execution, file_change, agent_message, reasoning, mcp_tool_call
+    command?: string;         // for command_execution
+    aggregated_output?: string;
+    exit_code?: number | null;
+    status?: string;
+    text?: string;            // for agent_message / reasoning
+    path?: string;            // for file_change
+    new_content?: string;     // for file_change
+  };
+  usage?: {
+    input_tokens?: number;
+    cached_input_tokens?: number;
+    output_tokens?: number;
+  };
   error?: string;
 }
 
@@ -1266,30 +1299,57 @@ function parseCodexOutput(stdout: string, outputFile: string): {
     try { events.push(JSON.parse(line) as CodexEvent); } catch { /* skip */ }
   }
 
-  const toolCalls = events.filter((e) => e.type === "tool_call" || e.type === "function_call").length;
+  // Codex --json wire format:
+  //   thread.started  → { thread_id }
+  //   item.started    → { item: { type, command?, path? } }
+  //   item.completed  → { item: { type, command?, aggregated_output?, exit_code?, text?, path? } }
+  //   turn.completed  → { usage: { input_tokens, output_tokens } }
+
+  let toolCalls = 0;
   const filesModified: string[] = [];
   let sessionId: string | undefined;
+  let lastAgentMessage = "";
 
   for (const event of events) {
-    if (event.type === "session_start" || event.type === "session_meta") {
-      const payload = event as unknown as { session_id?: string; id?: string; payload?: { id?: string } };
-      sessionId = payload.session_id || payload.id || payload.payload?.id;
+    // Session/thread ID
+    if (event.type === "thread.started" && event.thread_id) {
+      sessionId = event.thread_id;
     }
-    if (event.type === "tool_call" && event.tool === "write_file" && event.args?.path) {
-      filesModified.push(String(event.args.path));
-    }
-    if (event.type === "tool_call" && event.tool === "edit_file" && event.args?.path) {
-      filesModified.push(String(event.args.path));
+
+    if (!event.item) continue;
+
+    if (event.type === "item.completed" || event.type === "item.started") {
+      // Command executions = tool calls
+      if (event.item.type === "command_execution") {
+        toolCalls++;
+      }
+      // File changes
+      if (event.item.type === "file_change" && event.item.path) {
+        filesModified.push(event.item.path);
+      }
+      // MCP tool calls
+      if (event.item.type === "mcp_tool_call") {
+        toolCalls++;
+      }
+      // Agent messages — track the last one as potential final message
+      if (event.item.type === "agent_message" && event.item.text) {
+        lastAgentMessage = event.item.text;
+      }
     }
   }
 
+  // Prefer the -o output file, fall back to last agent_message from JSONL
   let finalMessage = "";
   try {
     if (existsSync(outputFile)) {
       finalMessage = readFileSync(outputFile, "utf-8");
-      try { execSync(`rm "${outputFile}"`, { encoding: "utf-8" }); } catch { /* ignore */ }
+      try { unlinkSync(outputFile); } catch { /* ignore */ }
     }
   } catch { /* skip */ }
+
+  if (!finalMessage && lastAgentMessage) {
+    finalMessage = lastAgentMessage;
+  }
 
   return { events, toolCalls, filesModified: [...new Set(filesModified)], sessionId, finalMessage };
 }
