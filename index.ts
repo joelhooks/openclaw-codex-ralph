@@ -22,6 +22,7 @@ import { generateCodebaseMap, enrichMapFromSession } from "./context-generator.j
 import { processRegistry, monitorProgress, getActualFilesModified } from "./process-helpers.js";
 import { StoryRetryTracker, DEFAULT_MAX_RETRIES, shouldSkipStory, formatSkippedSummary } from "./loop-guards.js";
 import { createStderrMonitor, formatIterationBehavior, type MonitorStats } from "./loop-monitor.js";
+import { verifyOutput } from "./output-verifier.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -77,6 +78,8 @@ interface IterationResult {
   toolCalls?: number;
   filesModified?: string[];
   duration: number;
+  verificationPassed?: boolean;
+  verificationWarnings?: string[];
 }
 
 // ============================================================================
@@ -263,6 +266,9 @@ interface IterationLogEntry {
   toolNames: string[];
   filesModified: string[];
   validationOutput?: string;
+  verificationPassed?: boolean;
+  verificationWarnings?: string[];
+  verificationRejectReason?: string;
   model: string;
   sandbox: string;
 }
@@ -435,7 +441,7 @@ function getLastCursor(): CursorEntry | null {
 // Failure Categorization
 // ============================================================================
 
-type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "unknown";
+type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "verification_rejected" | "unknown";
 
 function categorizeFailure(output: string): FailureCategory {
   const lower = output.toLowerCase();
@@ -1741,88 +1747,133 @@ async function executeRalphIterate(
   };
 
   if (result.success) {
-    // Mark story as passed
-    story.passes = true;
-    prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-    prd.metadata.lastIteration = new Date().toISOString();
-    prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-    writePRD(workdir, prd);
+    // ── Output verification: catch stories that pass validation but didn't meaningfully address the work ──
+    const verification = verifyOutput({
+      workdir: resolvePath(workdir),
+      story,
+      codexResult,
+      validationOutput: validation.output,
+    });
+    result.verificationPassed = verification.passed;
+    result.verificationWarnings = verification.warnings.length > 0 ? verification.warnings : undefined;
 
-    // Append to progress with final message
-    const summary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 800);
-    const progressEntry = [
-      `Completed: ${story.title}`,
-      `Files modified: ${codexResult.filesModified.join(", ") || "none"}`,
-      `Tool calls: ${codexResult.toolCalls}`,
-      `Validation: ${story.validationCommand || "default"}`,
-      `Summary: ${summary}`,
-    ].join("\n");
-    // Validate learning quality
-    const learningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-    if (!learningCheck.valid) {
-      console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
-      appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
-      // Record laziness in hivemind so future iterations see the pattern
+    if (!verification.passed) {
+      // Downgrade to failure — don't commit, don't mark as passed
+      result.success = false;
+      console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${verification.rejectReason}`);
       hivemindStore(
-        `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${learningCheck.reason}. This is a recurring quality issue — agents must provide structured learnings.`,
-        `ralph,laziness,quality,${prd.projectName}`
+        `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${verification.rejectReason}. Checks: ${verification.checks.map(c => `[${c.severity}] ${c.name}: ${c.message}`).join("; ")}`,
+        `ralph,verification,rejected,${prd.projectName}`
       );
+      writeRalphEvent("story_verification_rejected", {
+        jobId: iterateJobId,
+        storyId: story.id,
+        storyTitle: story.title,
+        error: verification.rejectReason || "Verification failed",
+        failureCategory: "verification_rejected",
+        duration: result.duration,
+        workdir,
+        codexSessionId: codexResult.sessionId,
+      });
     } else {
-      appendProgress(workdir, progressEntry);
+      // Log warnings if any
+      if (verification.warnings.length > 0) {
+        console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${verification.warnings.join("; ")}`);
+        hivemindStore(
+          `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${verification.warnings.join("; ")}`,
+          `ralph,verification,warning,${prd.projectName}`
+        );
+      }
+
+      // Mark story as passed
+      story.passes = true;
+      prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+      prd.metadata.lastIteration = new Date().toISOString();
+      prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
+      writePRD(workdir, prd);
+
+      // Append to progress with final message
+      const summary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 800);
+      const progressEntry = [
+        `Completed: ${story.title}`,
+        `Files modified: ${codexResult.filesModified.join(", ") || "none"}`,
+        `Tool calls: ${codexResult.toolCalls}`,
+        `Validation: ${story.validationCommand || "default"}`,
+        `Summary: ${summary}`,
+      ].join("\n");
+      // Validate learning quality
+      const learningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
+      if (!learningCheck.valid) {
+        console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
+        appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
+        // Record laziness in hivemind so future iterations see the pattern
+        hivemindStore(
+          `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${learningCheck.reason}. This is a recurring quality issue — agents must provide structured learnings.`,
+          `ralph,laziness,quality,${prd.projectName}`
+        );
+      } else {
+        appendProgress(workdir, progressEntry);
+      }
+
+      // Git commit
+      if (cfg.autoCommit) {
+        const hash = gitCommit(workdir, `ralph: ${story.title}`);
+        result.commitHash = hash || undefined;
+      }
+
+      // Enrich codebase map from session (post-commit)
+      if (codexResult.sessionId) {
+        const sessionFile = resolveSessionFile(codexResult.sessionId);
+        if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+      }
+
+      // Post-success: store learning in hivemind (only if committed)
+      if (result.commitHash) {
+        hivemindStore(
+          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
+          `ralph,learning,${prd.projectName}`
+        );
+      }
+
+      // Store extracted learnings in hivemind (regardless of commit — learnings are always valuable)
+      const iterateLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+      if (iterateLearnings && iterateLearnings.length >= 50) {
+        hivemindStore(
+          `Learnings from "${story.title}": ${iterateLearnings}`,
+          `ralph,success,learning,${prd.projectName},${story.id}`
+        );
+      }
+
+      // Update structured context
+      addContextStory(workdir, {
+        id: story.id,
+        title: story.title,
+        status: "completed",
+        filesModified: codexResult.filesModified,
+        learnings: iterateLearnings || codexResult.finalMessage.slice(0, 500),
+      });
+
+      // Store stderr insights for behavioral analysis
+      if (codexResult.stderrInsights) {
+        hivemindStore(
+          `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+          `ralph,session-insight,${prd.projectName}`
+        );
+      }
+
+      // Story complete notification
+      writeRalphEvent("story_complete", {
+        jobId: iterateJobId,
+        storyId: story.id,
+        storyTitle: story.title,
+        filesModified: codexResult.filesModified,
+        commitHash: result.commitHash,
+        duration: result.duration,
+        summary: codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 500),
+        workdir,
+        codexSessionId: codexResult.sessionId,
+      });
     }
-
-    // Git commit
-    if (cfg.autoCommit) {
-      const hash = gitCommit(workdir, `ralph: ${story.title}`);
-      result.commitHash = hash || undefined;
-    }
-
-    // Post-success: store learning in hivemind (only if committed)
-    if (result.commitHash) {
-      hivemindStore(
-        `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-        `ralph,learning,${prd.projectName}`
-      );
-    }
-
-    // Store extracted learnings in hivemind (regardless of commit — learnings are always valuable)
-    const iterateLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-    if (iterateLearnings && iterateLearnings.length >= 50) {
-      hivemindStore(
-        `Learnings from "${story.title}": ${iterateLearnings}`,
-        `ralph,success,learning,${prd.projectName},${story.id}`
-      );
-    }
-
-    // Update structured context
-    addContextStory(workdir, {
-      id: story.id,
-      title: story.title,
-      status: "completed",
-      filesModified: codexResult.filesModified,
-      learnings: iterateLearnings || codexResult.finalMessage.slice(0, 500),
-    });
-
-    // Store stderr insights for behavioral analysis
-    if (codexResult.stderrInsights) {
-      hivemindStore(
-        `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-        `ralph,session-insight,${prd.projectName}`
-      );
-    }
-
-    // Story complete notification
-    writeRalphEvent("story_complete", {
-      jobId: iterateJobId,
-      storyId: story.id,
-      storyTitle: story.title,
-      filesModified: codexResult.filesModified,
-      commitHash: result.commitHash,
-      duration: result.duration,
-      summary: codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 500),
-      workdir,
-      codexSessionId: codexResult.sessionId,
-    });
   } else {
     // Categorize the failure
     const failureCategory = categorizeFailure(validation.output);
@@ -1882,7 +1933,7 @@ async function executeRalphIterate(
   }
 
   // Write iteration log entry
-  const iterFailCat = result.success ? undefined : categorizeFailure(validation.output);
+  const iterFailCat = result.success ? undefined : (result.verificationPassed === false ? "verification_rejected" as FailureCategory : categorizeFailure(validation.output));
   appendIterationLog(workdir, {
     timestamp: new Date().toISOString(),
     epoch: Date.now(),
@@ -1906,6 +1957,8 @@ async function executeRalphIterate(
     toolNames: extractToolNames(codexResult.events),
     filesModified: codexResult.filesModified,
     validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
+    verificationPassed: result.verificationPassed,
+    verificationWarnings: result.verificationWarnings,
     model,
     sandbox: cfg.sandbox,
   });
@@ -1989,73 +2042,120 @@ async function executeRalphLoopSync(
       duration: Date.now() - startTime,
     };
 
+    if (iterResult.success) {
+      // ── Output verification ──
+      const syncVerification = verifyOutput({
+        workdir: resolvePath(workdir),
+        story,
+        codexResult,
+        validationOutput: validation.output,
+      });
+      iterResult.verificationPassed = syncVerification.passed;
+      iterResult.verificationWarnings = syncVerification.warnings.length > 0 ? syncVerification.warnings : undefined;
+
+      if (!syncVerification.passed) {
+        iterResult.success = false;
+        console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${syncVerification.rejectReason}`);
+        hivemindStore(
+          `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${syncVerification.rejectReason}`,
+          `ralph,verification,rejected,${prd.projectName}`
+        );
+        writeRalphEvent("story_verification_rejected", {
+          jobId: syncJobId,
+          storyId: story.id,
+          storyTitle: story.title,
+          error: syncVerification.rejectReason || "Verification failed",
+          failureCategory: "verification_rejected",
+          duration: iterResult.duration,
+          workdir,
+          codexSessionId: codexResult.sessionId,
+        });
+        // Fall through to failure handling below
+      } else {
+        if (syncVerification.warnings.length > 0) {
+          console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${syncVerification.warnings.join("; ")}`);
+          hivemindStore(
+            `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${syncVerification.warnings.join("; ")}`,
+            `ralph,verification,warning,${prd.projectName}`
+          );
+        }
+
+        story.passes = true;
+        prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+        prd.metadata.lastIteration = new Date().toISOString();
+        prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
+        writePRD(workdir, prd);
+        loopResult.storiesCompleted++;
+
+        const progressEntry = [
+          `Completed: ${story.title}`,
+          `Files: ${codexResult.filesModified.join(", ") || "none"}`,
+          `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
+        ].join("\n");
+        appendProgress(workdir, progressEntry);
+
+        // Validate learning quality
+        const syncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
+        if (!syncLearningCheck.valid) {
+          console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${syncLearningCheck.reason}`);
+          hivemindStore(
+            `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${syncLearningCheck.reason}. Agents must provide structured learnings.`,
+            `ralph,laziness,quality,${prd.projectName}`
+          );
+        }
+
+        if (cfg.autoCommit) {
+          const hash = gitCommit(workdir, `ralph: ${story.title}`);
+          iterResult.commitHash = hash || undefined;
+        }
+
+        // Enrich codebase map from session (post-commit)
+        if (codexResult.sessionId) {
+          const sessionFile = resolveSessionFile(codexResult.sessionId);
+          if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+        }
+
+        // Post-success: store learning in hivemind
+        if (iterResult.commitHash) {
+          hivemindStore(
+            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
+            `ralph,learning,${prd.projectName}`
+          );
+        }
+
+        // Store extracted learnings in hivemind (regardless of commit)
+        const syncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+        if (syncLearnings && syncLearnings.length >= 50) {
+          hivemindStore(
+            `Learnings from "${story.title}": ${syncLearnings}`,
+            `ralph,success,learning,${prd.projectName},${story.id}`
+          );
+        }
+
+        // Update structured context
+        addContextStory(workdir, {
+          id: story.id,
+          title: story.title,
+          status: "completed",
+          filesModified: codexResult.filesModified,
+          learnings: syncLearnings || codexResult.finalMessage.slice(0, 500),
+        });
+
+        // Store stderr insights
+        if (codexResult.stderrInsights) {
+          hivemindStore(
+            `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+            `ralph,session-insight,${prd.projectName}`
+          );
+        }
+      }
+    }
+
+    // Record retry after verification (which may downgrade success to failure)
     retryTracker.recordAttempt(story.id, iterResult.success);
 
-    if (iterResult.success) {
-      story.passes = true;
-      prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-      prd.metadata.lastIteration = new Date().toISOString();
-      prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-      writePRD(workdir, prd);
-      loopResult.storiesCompleted++;
-
-      const progressEntry = [
-        `Completed: ${story.title}`,
-        `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-        `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
-      ].join("\n");
-      appendProgress(workdir, progressEntry);
-
-      // Validate learning quality
-      const syncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-      if (!syncLearningCheck.valid) {
-        console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${syncLearningCheck.reason}`);
-        hivemindStore(
-          `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${syncLearningCheck.reason}. Agents must provide structured learnings.`,
-          `ralph,laziness,quality,${prd.projectName}`
-        );
-      }
-
-      if (cfg.autoCommit) {
-        const hash = gitCommit(workdir, `ralph: ${story.title}`);
-        iterResult.commitHash = hash || undefined;
-      }
-
-      // Post-success: store learning in hivemind
-      if (iterResult.commitHash) {
-        hivemindStore(
-          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-          `ralph,learning,${prd.projectName}`
-        );
-      }
-
-      // Store extracted learnings in hivemind (regardless of commit)
-      const syncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-      if (syncLearnings && syncLearnings.length >= 50) {
-        hivemindStore(
-          `Learnings from "${story.title}": ${syncLearnings}`,
-          `ralph,success,learning,${prd.projectName},${story.id}`
-        );
-      }
-
-      // Update structured context
-      addContextStory(workdir, {
-        id: story.id,
-        title: story.title,
-        status: "completed",
-        filesModified: codexResult.filesModified,
-        learnings: syncLearnings || codexResult.finalMessage.slice(0, 500),
-      });
-
-      // Store stderr insights
-      if (codexResult.stderrInsights) {
-        hivemindStore(
-          `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-          `ralph,session-insight,${prd.projectName}`
-        );
-      }
-    } else {
-      const failureCategory = categorizeFailure(validation.output);
+    if (!iterResult.success) {
+      const failureCategory: FailureCategory = iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output);
       const failEntry = [
         `Failed: ${story.title} [${failureCategory}]`,
         `Validation: ${validation.output.slice(0, 300)}`,
@@ -2063,11 +2163,13 @@ async function executeRalphLoopSync(
       ].join("\n");
       appendProgress(workdir, failEntry);
 
-      // Store failure pattern in hivemind (with category)
-      hivemindStore(
-        `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-        `ralph,failure,${failureCategory},${prd.projectName}`
-      );
+      // Store failure pattern in hivemind (with category) — skip if already stored by verification
+      if (failureCategory !== "verification_rejected") {
+        hivemindStore(
+          `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+          `ralph,failure,${failureCategory},${prd.projectName}`
+        );
+      }
 
       // Store stderr insights on failure
       if (codexResult.stderrInsights) {
@@ -2110,7 +2212,7 @@ async function executeRalphLoopSync(
           promptLength: prompt.length,
           success: false,
           validationPassed: validation.success,
-          failureCategory: categorizeFailure(validation.output),
+          failureCategory,
           duration: iterResult.duration,
           codexOutputLength: codexResult.output.length,
           codexFinalMessageLength: codexResult.finalMessage.length,
@@ -2118,6 +2220,8 @@ async function executeRalphLoopSync(
           toolNames: extractToolNames(codexResult.events),
           filesModified: codexResult.filesModified,
           validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
+          verificationPassed: iterResult.verificationPassed,
+          verificationWarnings: iterResult.verificationWarnings,
           model,
           sandbox: cfg.sandbox,
         });
@@ -2128,7 +2232,7 @@ async function executeRalphLoopSync(
     }
 
     // Write iteration log entry
-    const syncFailCat = iterResult.success ? undefined : categorizeFailure(validation.output);
+    const syncFailCat: FailureCategory | undefined = iterResult.success ? undefined : (iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output));
     appendIterationLog(workdir, {
       timestamp: new Date().toISOString(),
       epoch: Date.now(),
@@ -2152,6 +2256,8 @@ async function executeRalphLoopSync(
       toolNames: extractToolNames(codexResult.events),
       filesModified: codexResult.filesModified,
       validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
+      verificationPassed: iterResult.verificationPassed,
+      verificationWarnings: iterResult.verificationWarnings,
       model,
       sandbox: cfg.sandbox,
     });
@@ -2278,101 +2384,149 @@ async function executeRalphLoopAsync(
         duration: Date.now() - startTime,
       };
 
-      retryTracker.recordAttempt(story.id, iterResult.success);
       job.results.push(iterResult);
 
       if (iterResult.success) {
-        story.passes = true;
-        prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-        prd.metadata.lastIteration = new Date().toISOString();
-        prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-        writePRD(workdir, prd);
-        job.storiesCompleted++;
-
-        const progressEntry = [
-          `Completed: ${story.title}`,
-          `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-          `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
-        ].join("\n");
-        appendProgress(workdir, progressEntry);
-
-        // Validate learning quality
-        const asyncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-        if (!asyncLearningCheck.valid) {
-          console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${asyncLearningCheck.reason}`);
-          hivemindStore(
-            `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${asyncLearningCheck.reason}. Agents must provide structured learnings.`,
-            `ralph,laziness,quality,${prd.projectName}`
-          );
-        }
-
-        if (cfg.autoCommit) {
-          const hash = gitCommit(workdir, `ralph: ${story.title}`);
-          iterResult.commitHash = hash || undefined;
-        }
-
-        // Post-success: store learning in hivemind (only if committed)
-        if (iterResult.commitHash) {
-          hivemindStore(
-            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-            `ralph,learning,${prd.projectName}`
-          );
-        }
-
-        // Store extracted learnings in hivemind (regardless of commit)
-        const asyncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-        if (asyncLearnings && asyncLearnings.length >= 50) {
-          hivemindStore(
-            `Learnings from "${story.title}": ${asyncLearnings}`,
-            `ralph,success,learning,${prd.projectName},${story.id}`
-          );
-        }
-
-        // Update structured context
-        addContextStory(workdir, {
-          id: story.id,
-          title: story.title,
-          status: "completed",
-          filesModified: codexResult.filesModified,
-          learnings: asyncLearnings || codexResult.finalMessage.slice(0, 500),
+        // ── Output verification ──
+        const asyncVerification = verifyOutput({
+          workdir: resolvePath(workdir),
+          story,
+          codexResult,
+          validationOutput: validation.output,
         });
+        iterResult.verificationPassed = asyncVerification.passed;
+        iterResult.verificationWarnings = asyncVerification.warnings.length > 0 ? asyncVerification.warnings : undefined;
 
-        // Store stderr insights
-        if (codexResult.stderrInsights) {
+        if (!asyncVerification.passed) {
+          iterResult.success = false;
+          console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${asyncVerification.rejectReason}`);
           hivemindStore(
-            `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-            `ralph,session-insight,${prd.projectName}`
+            `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${asyncVerification.rejectReason}`,
+            `ralph,verification,rejected,${prd.projectName}`
           );
-        }
-
-        // Story complete notification
-        writeRalphEvent("story_complete", {
-          jobId: job.id,
-          storyId: story.id,
-          storyTitle: story.title,
-          filesModified: codexResult.filesModified,
-          commitHash: iterResult.commitHash,
-          duration: iterResult.duration,
-          summary: codexResult.finalMessage.slice(0, 500),
-          workdir,
-          codexSessionId: codexResult.sessionId,
-        });
-
-        emitLoopProgress(job, "iteration");
-
-        // Send openclaw system event for real-time monitoring
-        try {
-          const summarySnippet = (codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 200)).replace(/"/g, '\\"').replace(/\n/g, ' ');
-          const commitRef = iterResult.commitHash ? ` (${iterResult.commitHash})` : '';
-          const msg = `✅ Story complete: ${story.title}${commitRef} — ${summarySnippet}`;
-          execSync(`openclaw system event --mode now --text "${msg}"`, {
-            encoding: "utf-8",
-            timeout: 10000,
-            stdio: "pipe",
+          writeRalphEvent("story_verification_rejected", {
+            jobId: job.id,
+            storyId: story.id,
+            storyTitle: story.title,
+            error: asyncVerification.rejectReason || "Verification failed",
+            failureCategory: "verification_rejected",
+            duration: iterResult.duration,
+            workdir,
+            codexSessionId: codexResult.sessionId,
           });
-        } catch { /* non-fatal — don't block loop on notification failure */ }
-      } else {
-        const failureCategory = categorizeFailure(validation.output);
+          // Fall through to failure handling below
+        } else {
+          if (asyncVerification.warnings.length > 0) {
+            console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${asyncVerification.warnings.join("; ")}`);
+            hivemindStore(
+              `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${asyncVerification.warnings.join("; ")}`,
+              `ralph,verification,warning,${prd.projectName}`
+            );
+          }
+
+          story.passes = true;
+          prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+          prd.metadata.lastIteration = new Date().toISOString();
+          prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
+          writePRD(workdir, prd);
+          job.storiesCompleted++;
+
+          const progressEntry = [
+            `Completed: ${story.title}`,
+            `Files: ${codexResult.filesModified.join(", ") || "none"}`,
+            `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
+          ].join("\n");
+          appendProgress(workdir, progressEntry);
+
+          // Validate learning quality
+          const asyncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
+          if (!asyncLearningCheck.valid) {
+            console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${asyncLearningCheck.reason}`);
+            hivemindStore(
+              `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${asyncLearningCheck.reason}. Agents must provide structured learnings.`,
+              `ralph,laziness,quality,${prd.projectName}`
+            );
+          }
+
+          if (cfg.autoCommit) {
+            const hash = gitCommit(workdir, `ralph: ${story.title}`);
+            iterResult.commitHash = hash || undefined;
+          }
+
+          // Enrich codebase map from session (post-commit)
+          if (codexResult.sessionId) {
+            const sessionFile = resolveSessionFile(codexResult.sessionId);
+            if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+          }
+
+          // Post-success: store learning in hivemind (only if committed)
+          if (iterResult.commitHash) {
+            hivemindStore(
+              `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
+              `ralph,learning,${prd.projectName}`
+            );
+          }
+
+          // Store extracted learnings in hivemind (regardless of commit)
+          const asyncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+          if (asyncLearnings && asyncLearnings.length >= 50) {
+            hivemindStore(
+              `Learnings from "${story.title}": ${asyncLearnings}`,
+              `ralph,success,learning,${prd.projectName},${story.id}`
+            );
+          }
+
+          // Update structured context
+          addContextStory(workdir, {
+            id: story.id,
+            title: story.title,
+            status: "completed",
+            filesModified: codexResult.filesModified,
+            learnings: asyncLearnings || codexResult.finalMessage.slice(0, 500),
+          });
+
+          // Store stderr insights
+          if (codexResult.stderrInsights) {
+            hivemindStore(
+              `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+              `ralph,session-insight,${prd.projectName}`
+            );
+          }
+
+          // Story complete notification
+          writeRalphEvent("story_complete", {
+            jobId: job.id,
+            storyId: story.id,
+            storyTitle: story.title,
+            filesModified: codexResult.filesModified,
+            commitHash: iterResult.commitHash,
+            duration: iterResult.duration,
+            summary: codexResult.finalMessage.slice(0, 500),
+            workdir,
+            codexSessionId: codexResult.sessionId,
+          });
+
+          emitLoopProgress(job, "iteration");
+
+          // Send openclaw system event for real-time monitoring
+          try {
+            const summarySnippet = (codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 200)).replace(/"/g, '\\"').replace(/\n/g, ' ');
+            const commitRef = iterResult.commitHash ? ` (${iterResult.commitHash})` : '';
+            const msg = `✅ Story complete: ${story.title}${commitRef} — ${summarySnippet}`;
+            execSync(`openclaw system event --mode now --text "${msg}"`, {
+              encoding: "utf-8",
+              timeout: 10000,
+              stdio: "pipe",
+            });
+          } catch { /* non-fatal — don't block loop on notification failure */ }
+        }
+      }
+
+      // Record retry after verification (which may downgrade success to failure)
+      retryTracker.recordAttempt(story.id, iterResult.success);
+
+      if (!iterResult.success) {
+        const failureCategory: FailureCategory = iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output);
         const failEntry = [
           `Failed: ${story.title} [${failureCategory}]`,
           `Validation: ${validation.output.slice(0, 300)}`,
@@ -2380,11 +2534,13 @@ async function executeRalphLoopAsync(
         ].join("\n");
         appendProgress(workdir, failEntry);
 
-        // Store failure pattern in hivemind (with category)
-        hivemindStore(
-          `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-          `ralph,failure,${failureCategory},${prd.projectName}`
-        );
+        // Store failure pattern in hivemind (with category) — skip if already stored by verification
+        if (failureCategory !== "verification_rejected") {
+          hivemindStore(
+            `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
+            `ralph,failure,${failureCategory},${prd.projectName}`
+          );
+        }
 
         // Store stderr insights on failure
         if (codexResult.stderrInsights) {
@@ -2457,6 +2613,8 @@ async function executeRalphLoopAsync(
             toolNames: extractToolNames(codexResult.events),
             filesModified: codexResult.filesModified,
             validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
+            verificationPassed: iterResult.verificationPassed,
+            verificationWarnings: iterResult.verificationWarnings,
             model: loopCfg.model,
             sandbox: cfg.sandbox,
           });
@@ -2478,7 +2636,7 @@ async function executeRalphLoopAsync(
       }
 
       // Write iteration log entry
-      const asyncFailCat = iterResult.success ? undefined : categorizeFailure(validation.output);
+      const asyncFailCat: FailureCategory | undefined = iterResult.success ? undefined : (iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output));
       appendIterationLog(workdir, {
         timestamp: new Date().toISOString(),
         epoch: Date.now(),
@@ -2502,6 +2660,8 @@ async function executeRalphLoopAsync(
         toolNames: extractToolNames(codexResult.events),
         filesModified: codexResult.filesModified,
         validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
+        verificationPassed: iterResult.verificationPassed,
+        verificationWarnings: iterResult.verificationWarnings,
         model: loopCfg.model,
         sandbox: cfg.sandbox,
       });
