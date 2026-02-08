@@ -42,6 +42,6 @@
       "description": "Validation error output if validation failed, empty string if passed"
     }
   },
-  "required": ["success", "summary", "files_modified", "learnings", "validation_passed"],
+  "required": ["success", "summary", "files_modified", "learnings", "validation_passed", "error_output"],
   "additionalProperties": false
 }
