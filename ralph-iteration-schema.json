@@ -1,0 +1,46 @@
+{
+  "type": "object",
+  "properties": {
+    "success": {
+      "type": "boolean",
+      "description": "Whether the iteration completed its goals successfully"
+    },
+    "summary": {
+      "type": "string",
+      "description": "What was accomplished or what went wrong. Be specific about files changed and why."
+    },
+    "files_modified": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of file paths that were created or modified"
+    },
+    "learnings": {
+      "type": "object",
+      "properties": {
+        "technical_discovery": {
+          "type": "string",
+          "description": "Non-obvious technical insight discovered during this iteration. Must be specific and actionable, not generic."
+        },
+        "gotcha_for_next_iteration": {
+          "type": "string",
+          "description": "What the next iteration needs to watch out for. Specific warnings about code state, edge cases, or incomplete work."
+        },
+        "files_context": {
+          "type": "string",
+          "description": "Key files and their roles relevant to this story. Help the next agent orient quickly."
+        }
+      },
+      "required": ["technical_discovery", "gotcha_for_next_iteration", "files_context"]
+    },
+    "validation_passed": {
+      "type": "boolean",
+      "description": "Whether the validation command (typecheck/tests) passed"
+    },
+    "error_output": {
+      "type": "string",
+      "description": "Validation error output if validation failed, empty string if passed"
+    }
+  },
+  "required": ["success", "summary", "files_modified", "learnings", "validation_passed"],
+  "additionalProperties": false
+}

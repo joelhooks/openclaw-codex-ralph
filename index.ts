@@ -11,14 +11,30 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emitDiagnosticEvent } from "openclaw/plugin-sdk";
 import { execFileSync, execSync, spawn } from "child_process";
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, statSync, appendFileSync } from "fs";
-import { join, resolve, basename } from "path";
+import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { autopsyTools } from "./autopsy.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ============================================================================
 // Types
 // ============================================================================
+
+interface RalphIterationOutput {
+  success: boolean;
+  summary: string;
+  files_modified: string[];
+  learnings: {
+    technical_discovery: string;
+    gotcha_for_next_iteration: string;
+    files_context: string;
+  };
+  validation_passed: boolean;
+  error_output?: string;
+}
 
 interface Story {
   id: string;
@@ -1189,8 +1205,23 @@ interface LearningValidation {
   extractedLearnings: string;
 }
 
-function validateLearnings(finalMessage: string): LearningValidation {
-  // Check for lazy patterns
+function validateLearnings(finalMessage: string, structured?: RalphIterationOutput): LearningValidation {
+  // Structured output path — check JSON learnings directly
+  if (structured?.learnings) {
+    const { technical_discovery, gotcha_for_next_iteration, files_context } = structured.learnings;
+    const totalLength = (technical_discovery || "").length + (gotcha_for_next_iteration || "").length + (files_context || "").length;
+    if (totalLength >= 50) {
+      const extracted = [
+        technical_discovery && `Technical Discovery: ${technical_discovery}`,
+        gotcha_for_next_iteration && `Gotcha: ${gotcha_for_next_iteration}`,
+        files_context && `Files Context: ${files_context}`,
+      ].filter(Boolean).join("\n");
+      return { valid: true, extractedLearnings: extracted };
+    }
+    return { valid: false, reason: `Structured learnings too short (${totalLength} chars, minimum 50)`, extractedLearnings: "" };
+  }
+
+  // Fallback: regex-based validation for free-form text
   const lazyPatterns = [
     /learnings?:\s*(\n\s*-\s*)?none/i,
     /nothing\s*(new|notable|to\s*report)/i,
@@ -1206,10 +1237,7 @@ function validateLearnings(finalMessage: string): LearningValidation {
     }
   }
 
-  // Extract structured learnings
   const extracted = extractStructuredLearnings(finalMessage);
-
-  // Check minimum quality: at least 50 chars of learning content
   if (extracted.length < 50) {
     return { valid: false, reason: `Learning content too short (${extracted.length} chars, minimum 50)`, extractedLearnings: extracted };
   }
@@ -1217,8 +1245,17 @@ function validateLearnings(finalMessage: string): LearningValidation {
   return { valid: true, extractedLearnings: extracted };
 }
 
-function extractStructuredLearnings(finalMessage: string): string {
-  // Try to find structured learning sections
+function extractStructuredLearnings(finalMessage: string, structured?: RalphIterationOutput): string {
+  // Structured output path — return JSON learnings directly
+  if (structured?.learnings) {
+    const parts: string[] = [];
+    if (structured.learnings.technical_discovery) parts.push(`Technical Discovery: ${structured.learnings.technical_discovery}`);
+    if (structured.learnings.gotcha_for_next_iteration) parts.push(`Gotcha: ${structured.learnings.gotcha_for_next_iteration}`);
+    if (structured.learnings.files_context) parts.push(`Files Context: ${structured.learnings.files_context}`);
+    if (parts.length > 0) return parts.join("\n");
+  }
+
+  // Fallback: regex-based extraction for free-form text
   const sectionPatterns = [
     /## Learnings\s*\n([\s\S]*?)(?=\n## [^#]|\n---|\Z)/i,
     /### Technical Discovery\s*\n([\s\S]*?)(?=\n### |\n## |\n---|\Z)/i,
@@ -1238,7 +1275,6 @@ function extractStructuredLearnings(finalMessage: string): string {
     return parts.join("\n");
   }
 
-  // Fallback: look for anything after common learning markers
   const fallbackPatterns = [
     /learnings?:\s*\n?([\s\S]{50,}?)(?=\n## |\n---|\n\n\n)/i,
     /(?:what i learned|key takeaway|lesson)s?:\s*\n?([\s\S]{50,}?)(?=\n## |\n---|\n\n\n)/i,
@@ -1280,6 +1316,7 @@ interface CodexIterationResult {
   success: boolean;
   output: string;
   finalMessage: string;
+  structuredResult?: RalphIterationOutput;
   events: CodexEvent[];
   toolCalls: number;
   filesModified: string[];
@@ -1292,6 +1329,7 @@ function parseCodexOutput(stdout: string, outputFile: string): {
   filesModified: string[];
   sessionId?: string;
   finalMessage: string;
+  structuredResult?: RalphIterationOutput;
 } {
   const events: CodexEvent[] = [];
   const lines = stdout.split("\n").filter((l) => l.trim());
@@ -1351,7 +1389,18 @@ function parseCodexOutput(stdout: string, outputFile: string): {
     finalMessage = lastAgentMessage;
   }
 
-  return { events, toolCalls, filesModified: [...new Set(filesModified)], sessionId, finalMessage };
+  // Try to parse structured output (when --output-schema was used)
+  let structuredResult: RalphIterationOutput | undefined;
+  if (finalMessage) {
+    try {
+      const parsed = JSON.parse(finalMessage);
+      if (typeof parsed === "object" && parsed !== null && "success" in parsed && "summary" in parsed && "learnings" in parsed) {
+        structuredResult = parsed as RalphIterationOutput;
+      }
+    } catch { /* not structured JSON — free-form text, use regex fallback */ }
+  }
+
+  return { events, toolCalls, filesModified: [...new Set(filesModified)], sessionId, finalMessage, structuredResult };
 }
 
 async function runCodexIteration(
@@ -1362,11 +1411,13 @@ async function runCodexIteration(
   return new Promise((resolve) => {
     const resolvedWorkdir = resolvePath(workdir);
     const outputFile = join(resolvedWorkdir, `.ralph-last-message-${Date.now()}.txt`);
+    const schemaFile = join(__dirname, "ralph-iteration-schema.json");
 
     const args = [
       "exec",
       "--sandbox", cfg.sandbox,
       "--json",
+      "--output-schema", schemaFile,
       "-o", outputFile,
       "-C", resolvedWorkdir,
       "-m", cfg.model,
@@ -1405,6 +1456,7 @@ async function runCodexIteration(
         success: code === 0,
         output,
         finalMessage: parsed.finalMessage,
+        structuredResult: parsed.structuredResult,
         events: parsed.events,
         toolCalls: parsed.toolCalls,
         filesModified: parsed.filesModified,
@@ -1434,6 +1486,7 @@ async function runCodexIteration(
         success: false,
         output,
         finalMessage: partial.finalMessage,
+        structuredResult: partial.structuredResult,
         events: partial.events,
         toolCalls: partial.toolCalls,
         filesModified: partial.filesModified,
@@ -1667,15 +1720,16 @@ async function executeRalphIterate(
     writePRD(workdir, prd);
 
     // Append to progress with final message
+    const summary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 800);
     const progressEntry = [
       `Completed: ${story.title}`,
       `Files modified: ${codexResult.filesModified.join(", ") || "none"}`,
       `Tool calls: ${codexResult.toolCalls}`,
       `Validation: ${story.validationCommand || "default"}`,
-      `Summary: ${codexResult.finalMessage.slice(0, 800)}`,
+      `Summary: ${summary}`,
     ].join("\n");
     // Validate learning quality
-    const learningCheck = validateLearnings(codexResult.finalMessage);
+    const learningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
     if (!learningCheck.valid) {
       console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
       appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
@@ -1697,7 +1751,7 @@ async function executeRalphIterate(
     // Post-success: store learning in hivemind (only if committed)
     if (result.commitHash) {
       hivemindStore(
-        `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+        `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
         `ralph,learning,${prd.projectName}`
       );
     }
@@ -1708,7 +1762,7 @@ async function executeRalphIterate(
       title: story.title,
       status: "completed",
       filesModified: codexResult.filesModified,
-      learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
+      learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
     });
 
     // Story complete notification
@@ -1719,7 +1773,7 @@ async function executeRalphIterate(
       filesModified: codexResult.filesModified,
       commitHash: result.commitHash,
       duration: result.duration,
-      summary: codexResult.finalMessage.slice(0, 500),
+      summary: codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 500),
       workdir,
       codexSessionId: codexResult.sessionId,
     });
@@ -1882,12 +1936,12 @@ async function executeRalphLoopSync(
       const progressEntry = [
         `Completed: ${story.title}`,
         `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-        `Summary: ${codexResult.finalMessage.slice(0, 400)}`,
+        `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
       ].join("\n");
       appendProgress(workdir, progressEntry);
 
       // Validate learning quality
-      const syncLearningCheck = validateLearnings(codexResult.finalMessage);
+      const syncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
       if (!syncLearningCheck.valid) {
         console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${syncLearningCheck.reason}`);
         hivemindStore(
@@ -1904,7 +1958,7 @@ async function executeRalphLoopSync(
       // Post-success: store learning in hivemind
       if (iterResult.commitHash) {
         hivemindStore(
-          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
           `ralph,learning,${prd.projectName}`
         );
       }
@@ -1915,14 +1969,14 @@ async function executeRalphLoopSync(
         title: story.title,
         status: "completed",
         filesModified: codexResult.filesModified,
-        learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
+        learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
       });
     } else {
       const failureCategory = categorizeFailure(validation.output);
       const failEntry = [
         `Failed: ${story.title} [${failureCategory}]`,
         `Validation: ${validation.output.slice(0, 300)}`,
-        `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
+        `Codex: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
       ].join("\n");
       appendProgress(workdir, failEntry);
 
@@ -2136,12 +2190,12 @@ async function executeRalphLoopAsync(
         const progressEntry = [
           `Completed: ${story.title}`,
           `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-          `Summary: ${codexResult.finalMessage.slice(0, 400)}`,
+          `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
         ].join("\n");
         appendProgress(workdir, progressEntry);
 
         // Validate learning quality
-        const asyncLearningCheck = validateLearnings(codexResult.finalMessage);
+        const asyncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
         if (!asyncLearningCheck.valid) {
           console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${asyncLearningCheck.reason}`);
           hivemindStore(
@@ -2158,7 +2212,7 @@ async function executeRalphLoopAsync(
         // Post-success: store learning in hivemind (only if committed)
         if (iterResult.commitHash) {
           hivemindStore(
-            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.finalMessage.slice(0, 300)}`,
+            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
             `ralph,learning,${prd.projectName}`
           );
         }
@@ -2169,7 +2223,7 @@ async function executeRalphLoopAsync(
           title: story.title,
           status: "completed",
           filesModified: codexResult.filesModified,
-          learnings: extractStructuredLearnings(codexResult.finalMessage) || codexResult.finalMessage.slice(0, 500),
+          learnings: extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult) || codexResult.finalMessage.slice(0, 500),
         });
 
         // Story complete notification
@@ -2189,7 +2243,7 @@ async function executeRalphLoopAsync(
 
         // Send openclaw system event for real-time monitoring
         try {
-          const summarySnippet = codexResult.finalMessage.slice(0, 200).replace(/"/g, '\\"').replace(/\n/g, ' ');
+          const summarySnippet = (codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 200)).replace(/"/g, '\\"').replace(/\n/g, ' ');
           const commitRef = iterResult.commitHash ? ` (${iterResult.commitHash})` : '';
           const msg = `✅ Story complete: ${story.title}${commitRef} — ${summarySnippet}`;
           execSync(`openclaw system event --mode now --text "${msg}"`, {
@@ -2203,7 +2257,7 @@ async function executeRalphLoopAsync(
         const failEntry = [
           `Failed: ${story.title} [${failureCategory}]`,
           `Validation: ${validation.output.slice(0, 300)}`,
-          `Codex: ${codexResult.finalMessage.slice(0, 300)}`,
+          `Codex: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
         ].join("\n");
         appendProgress(workdir, failEntry);
 
