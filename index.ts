@@ -16,6 +16,10 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { autopsyTools } from "./autopsy.js";
+import { VALIDATION_OUTPUT_LIMIT, captureValidation } from "./validation-helpers.js";
+import { deduplicateFailureContext } from "./prompt-helpers.js";
+import { processRegistry, monitorProgress, getActualFilesModified } from "./process-helpers.js";
+import { StoryRetryTracker, DEFAULT_MAX_RETRIES, shouldSkipStory, formatSkippedSummary } from "./loop-guards.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -813,12 +817,6 @@ function appendProgress(workdir: string, entry: string): void {
   writeFileSync(progressPath, `${existing}\n---\n[${timestamp}]\n${entry}\n`);
 }
 
-function readAgentsMd(workdir: string): string {
-  const agentsPath = join(resolvePath(workdir), "AGENTS.md");
-  if (!existsSync(agentsPath)) return "";
-  return readFileSync(agentsPath, "utf-8");
-}
-
 function getNextStory(prd: PRD): Story | null {
   const pending = prd.stories
     .filter((s) => !s.passes)
@@ -986,22 +984,8 @@ function extractSessionMessages(events: SessionEvent[], ranges?: string): Array<
 }
 
 function runValidation(workdir: string, command?: string): { success: boolean; output: string } {
-  if (!command) {
-    // Default: try typecheck then test
-    command = "npm run typecheck 2>/dev/null || tsc --noEmit; npm test 2>/dev/null || true";
-  }
-  try {
-    const output = execSync(command, {
-      cwd: resolvePath(workdir),
-      encoding: "utf-8",
-      timeout: 300000,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return { success: true, output };
-  } catch (error) {
-    const err = error as { stdout?: string; stderr?: string; message?: string };
-    return { success: false, output: err.stdout || err.stderr || err.message || "Validation failed" };
-  }
+  const result = captureValidation(resolvePath(workdir), command);
+  return { success: result.success, output: result.output };
 }
 
 function gitCommit(workdir: string, message: string): string | null {
@@ -1106,7 +1090,7 @@ function buildPreviousAttemptContext(workdir: string, storyId: string): string {
   return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1128,10 +1112,9 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, agentsMd
     parts.push(`Run: \`${story.validationCommand}\``);
   }
 
-  if (agentsMd) {
-    parts.push(`\n## Project Guidelines (AGENTS.md)`);
-    parts.push(agentsMd);
-  }
+  // NOTE: AGENTS.md is NOT injected here — Codex auto-loads it from the repo directory.
+  // Double-injecting caused 31k+ char prompts that exceeded the model context window,
+  // making the model exit immediately with 0 tool calls (~8s duration).
 
   if (progress) {
     parts.push(`\n## Previous Progress`);
@@ -1437,6 +1420,15 @@ async function runCodexIteration(
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    processRegistry.register(child, "codex-iteration");
+
+    const progressMonitor = monitorProgress(child.stdout!, {
+      stallTimeoutMs: 120000,
+      onStall: () => {
+        if (!child.killed) child.kill("SIGTERM");
+      },
+    });
+
     let stdout = "";
     let stderr = "";
 
@@ -1449,8 +1441,12 @@ async function runCodexIteration(
     });
 
     child.on("close", (code: number | null) => {
+      progressMonitor.cancel();
       const parsed = parseCodexOutput(stdout, outputFile);
       const output = parsed.finalMessage || stdout.slice(0, 5000);
+
+      const gitFiles = code === 0 ? getActualFilesModified(resolvedWorkdir) : [];
+      const allFilesModified = [...new Set([...gitFiles, ...parsed.filesModified])];
 
       resolve({
         success: code === 0,
@@ -1459,7 +1455,7 @@ async function runCodexIteration(
         structuredResult: parsed.structuredResult,
         events: parsed.events,
         toolCalls: parsed.toolCalls,
-        filesModified: parsed.filesModified,
+        filesModified: allFilesModified,
         sessionId: parsed.sessionId,
       });
     });
@@ -1478,6 +1474,7 @@ async function runCodexIteration(
 
     // Timeout after 10 minutes — preserve partial data from accumulated stdout
     setTimeout(() => {
+      progressMonitor.cancel();
       child.kill("SIGTERM");
       const partial = parseCodexOutput(stdout, outputFile);
       const output = "Timeout: iteration exceeded 10 minutes\n" + (partial.finalMessage || stdout.slice(0, 5000));
@@ -1666,7 +1663,6 @@ async function executeRalphIterate(
   }
 
   const progress = readProgress(workdir);
-  const agentsMd = readAgentsMd(workdir);
 
   // Pre-iteration: query hivemind for relevant prior learnings
   const hivemindContext = aggressiveHivemindPull(story, prd, workdir);
@@ -1674,7 +1670,7 @@ async function executeRalphIterate(
   const structuredCtx = buildStructuredContextSnippet(workdir);
   const failurePatterns = buildFailurePatternContext(workdir);
   const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-  const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
   const iterateJobId = `iterate-${Date.now().toString(36)}`;
 
@@ -1851,7 +1847,7 @@ async function executeRalphIterate(
     toolCalls: codexResult.toolCalls,
     toolNames: extractToolNames(codexResult.events),
     filesModified: codexResult.filesModified,
-    validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+    validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
     model,
     sandbox: cfg.sandbox,
   });
@@ -1870,6 +1866,7 @@ async function executeRalphLoopSync(
   const stopOnFailure = params.stopOnFailure;
 
   const loopCfg = { ...cfg, model };
+  const retryTracker = new StoryRetryTracker(DEFAULT_MAX_RETRIES);
 
   const loopResult: LoopResult = {
     success: false,
@@ -1894,17 +1891,21 @@ async function executeRalphLoopSync(
       break;
     }
 
+    if (shouldSkipStory(story.id, workdir, DEFAULT_MAX_RETRIES)) {
+      appendProgress(workdir, `Skipped: ${story.title} — exceeded ${DEFAULT_MAX_RETRIES} retries, needs human review`);
+      continue;
+    }
+
     loopResult.iterationsRun++;
 
     const progress = readProgress(workdir);
-    const agentsMd = readAgentsMd(workdir);
 
     // Pre-iteration: query hivemind for relevant prior learnings
     const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
     const structuredCtx = buildStructuredContextSnippet(workdir);
     const failurePatterns = buildFailurePatternContext(workdir);
     const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-    const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
     const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
     const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
@@ -1924,6 +1925,8 @@ async function executeRalphLoopSync(
       filesModified: codexResult.filesModified,
       duration: Date.now() - startTime,
     };
+
+    retryTracker.recordAttempt(story.id, iterResult.success);
 
     if (iterResult.success) {
       story.passes = true;
@@ -2026,7 +2029,7 @@ async function executeRalphLoopSync(
           toolCalls: codexResult.toolCalls,
           toolNames: extractToolNames(codexResult.events),
           filesModified: codexResult.filesModified,
-          validationOutput: validation.output.slice(0, 2000),
+          validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
           model,
           sandbox: cfg.sandbox,
         });
@@ -2060,7 +2063,7 @@ async function executeRalphLoopSync(
       toolCalls: codexResult.toolCalls,
       toolNames: extractToolNames(codexResult.events),
       filesModified: codexResult.filesModified,
-      validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+      validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
       model,
       sandbox: cfg.sandbox,
     });
@@ -2095,6 +2098,7 @@ async function executeRalphLoopAsync(
   const stopOnFailure = params.stopOnFailure;
 
   const loopCfg = { ...cfg };
+  const retryTracker = new StoryRetryTracker(DEFAULT_MAX_RETRIES);
 
   emitLoopProgress(job, "start");
 
@@ -2144,19 +2148,23 @@ async function executeRalphLoopAsync(
         return;
       }
 
+      if (shouldSkipStory(story.id, workdir, DEFAULT_MAX_RETRIES)) {
+        appendProgress(workdir, `Skipped: ${story.title} — exceeded ${DEFAULT_MAX_RETRIES} retries, needs human review`);
+        continue;
+      }
+
       job.currentIteration = i + 1;
       job.currentStory = { id: story.id, title: story.title };
       emitLoopProgress(job, "iteration");
 
       const progress = readProgress(workdir);
-      const agentsMd = readAgentsMd(workdir);
 
       // Pre-iteration: query hivemind for relevant prior learnings
       const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
       const structuredCtx = buildStructuredContextSnippet(workdir);
       const failurePatterns = buildFailurePatternContext(workdir);
       const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-      const prompt = buildIterationPrompt(prd, story, progress, agentsMd, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
 
       // Persist prompt to disk
       const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
@@ -2177,6 +2185,7 @@ async function executeRalphLoopAsync(
         duration: Date.now() - startTime,
       };
 
+      retryTracker.recordAttempt(story.id, iterResult.success);
       job.results.push(iterResult);
 
       if (iterResult.success) {
@@ -2329,7 +2338,7 @@ async function executeRalphLoopAsync(
             toolCalls: codexResult.toolCalls,
             toolNames: extractToolNames(codexResult.events),
             filesModified: codexResult.filesModified,
-            validationOutput: validation.output.slice(0, 2000),
+            validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
             model: loopCfg.model,
             sandbox: cfg.sandbox,
           });
@@ -2374,7 +2383,7 @@ async function executeRalphLoopAsync(
         toolCalls: codexResult.toolCalls,
         toolNames: extractToolNames(codexResult.events),
         filesModified: codexResult.filesModified,
-        validationOutput: !validation.success ? validation.output.slice(0, 2000) : undefined,
+        validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
         model: loopCfg.model,
         sandbox: cfg.sandbox,
       });
