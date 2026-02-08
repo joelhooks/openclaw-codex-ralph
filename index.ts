@@ -18,6 +18,7 @@ import { createHash } from "crypto";
 import { autopsyTools } from "./autopsy.js";
 import { VALIDATION_OUTPUT_LIMIT, captureValidation } from "./validation-helpers.js";
 import { deduplicateFailureContext } from "./prompt-helpers.js";
+import { generateCodebaseMap, enrichMapFromSession } from "./context-generator.js";
 import { processRegistry, monitorProgress, getActualFilesModified } from "./process-helpers.js";
 import { StoryRetryTracker, DEFAULT_MAX_RETRIES, shouldSkipStory, formatSkippedSummary } from "./loop-guards.js";
 
@@ -1090,7 +1091,7 @@ function buildPreviousAttemptContext(workdir: string, storyId: string): string {
   return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1115,6 +1116,10 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemind
   // NOTE: AGENTS.md is NOT injected here — Codex auto-loads it from the repo directory.
   // Double-injecting caused 31k+ char prompts that exceeded the model context window,
   // making the model exit immediately with 0 tool calls (~8s duration).
+
+  if (codebaseMap) {
+    parts.push(`\n${codebaseMap}`);
+  }
 
   if (progress) {
     parts.push(`\n## Previous Progress`);
@@ -1664,13 +1669,16 @@ async function executeRalphIterate(
 
   const progress = readProgress(workdir);
 
+  // Pre-iteration: generate codebase map so Codex doesn't waste time exploring
+  const codebaseMap = generateCodebaseMap(workdir);
+
   // Pre-iteration: query hivemind for relevant prior learnings
   const hivemindContext = aggressiveHivemindPull(story, prd, workdir);
   // Read structured context from .ralph-context.json
   const structuredCtx = buildStructuredContextSnippet(workdir);
   const failurePatterns = buildFailurePatternContext(workdir);
   const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
 
   const iterateJobId = `iterate-${Date.now().toString(36)}`;
 
@@ -1899,13 +1907,14 @@ async function executeRalphLoopSync(
     loopResult.iterationsRun++;
 
     const progress = readProgress(workdir);
+    const codebaseMap = generateCodebaseMap(workdir);
 
     // Pre-iteration: query hivemind for relevant prior learnings
     const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
     const structuredCtx = buildStructuredContextSnippet(workdir);
     const failurePatterns = buildFailurePatternContext(workdir);
     const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
 
     const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
     const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
@@ -2158,13 +2167,14 @@ async function executeRalphLoopAsync(
       emitLoopProgress(job, "iteration");
 
       const progress = readProgress(workdir);
+      const codebaseMap = generateCodebaseMap(workdir);
 
       // Pre-iteration: query hivemind for relevant prior learnings
       const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
       const structuredCtx = buildStructuredContextSnippet(workdir);
       const failurePatterns = buildFailurePatternContext(workdir);
       const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined);
+      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
 
       // Persist prompt to disk
       const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
