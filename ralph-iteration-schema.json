@@ -30,7 +30,8 @@
           "description": "Key files and their roles relevant to this story. Help the next agent orient quickly."
         }
       },
-      "required": ["technical_discovery", "gotcha_for_next_iteration", "files_context"]
+      "required": ["technical_discovery", "gotcha_for_next_iteration", "files_context"],
+      "additionalProperties": false
     },
     "validation_passed": {
       "type": "boolean",
