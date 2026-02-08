@@ -393,7 +393,7 @@ function writeCursorEntry(label: string, details?: string): CursorEntry {
 
 function getLastCursor(): CursorEntry | null {
   const cursor = readCursor();
-  return cursor.entries.length > 0 ? cursor.entries[cursor.entries.length - 1] : null;
+  return cursor.entries.length > 0 ? cursor.entries[cursor.entries.length - 1]! : null;
 }
 
 // ============================================================================
