@@ -1,24 +1,22 @@
 # openclaw-codex-ralph
 
-A [Moltbot/Clawdbot](https://github.com/anthropics/clawdbot) plugin for running autonomous AI coding loops using [OpenAI Codex CLI](https://github.com/openai/codex).
+An [OpenClaw](https://github.com/joelhooks/openclaw) plugin for autonomous AI coding loops using [Codex CLI](https://github.com/openai/codex).
 
-Based on the [Ralph pattern](https://github.com/snarktank/ralph) - spawn fresh AI sessions for each task, validate with tests, commit on success, repeat until done.
+Based on the [Ralph pattern](https://github.com/snarktank/ralph) — spawn fresh AI sessions for each task, validate with tests, commit on success, repeat until done.
 
-## Why Ralph?
+## What It Does
 
-Traditional AI coding sessions accumulate context and can drift. Ralph takes a different approach:
-
-- **Fresh context per iteration** - Each task gets a clean AI session
-- **Persistent state via git** - Completed work lives in commits, not context
-- **Progress tracking** - `progress.txt` carries learnings forward
-- **Validation gates** - Typecheck/tests must pass before moving on
-- **Granular tasks** - Stories should fit in a single context window
+- **26 tools** registered as an OpenClaw plugin
+- **Fresh Codex sessions** per iteration — no context drift
+- **Hivemind integration** — aggressive multi-query learning pulls (4 queries, 16 results per iteration)
+- **Learning enforcement** — validates agent output quality, flags lazy "Learnings: None" responses
+- **Failure pattern propagation** — recurring failures get escalated in prompts with root cause demands
+- **Iteration logging** — per-project JSONL log + centralized prompt persistence with SHA-256 hashes
+- **Repo autopsy tools** — deep analysis of any GitHub repo (search, AST, blame, hotspots, secrets)
 
 ## Installation
 
-### 1. Install the plugin
-
-Add to your `~/.moltbot/moltbot.json`:
+Add to your `~/.openclaw/openclaw.json`:
 
 ```json
 {
@@ -32,8 +30,8 @@ Add to your `~/.moltbot/moltbot.json`:
       "openclaw-codex-ralph": {
         "enabled": true,
         "config": {
-          "model": "gpt-5.2-codex",
-          "sandbox": "workspace-write",
+          "model": "gpt-5.3-codex",
+          "sandbox": "danger-full-access",
           "autoCommit": true
         }
       }
@@ -42,66 +40,141 @@ Add to your `~/.moltbot/moltbot.json`:
 }
 ```
 
-### 2. Restart Moltbot
+Restart the gateway:
 
 ```bash
-moltbot gateway restart
+openclaw gateway restart
 ```
 
-### 3. Verify installation
+Verify:
 
 ```bash
-moltbot plugins list | grep ralph
+# Should show 26 tools registered
+openclaw gateway restart 2>&1 | grep ralph
 ```
 
 ## Requirements
 
 - [Codex CLI](https://github.com/openai/codex) installed and authenticated
-- Moltbot/Clawdbot running
+- [OpenClaw](https://github.com/joelhooks/openclaw) running
+- `swarm` CLI in PATH (for hivemind learning capture — optional but recommended)
 
-## Usage
+## Tools (26)
 
-### Initialize a project
+### Core Loop
+| Tool | Description |
+|------|-------------|
+| `ralph_init` | Initialize project with prd.json + progress.txt |
+| `ralph_add_story` | Add story to prd.json |
+| `ralph_status` | Check pending/completed stories |
+| `ralph_edit_story` | Edit story priority, description, status |
+| `ralph_iterate` | Run single iteration (pick story, spawn Codex, validate, commit) |
+| `ralph_loop` | Start async loop in background (returns job ID immediately) |
+| `ralph_loop_status` | Check running/completed loop jobs |
+| `ralph_loop_cancel` | Cancel a running loop |
+
+### Observability
+| Tool | Description |
+|------|-------------|
+| `ralph_iterations` | Browse iteration history — timing, tools, prompts, session cross-refs |
+| `ralph_cursor` | Timestamp bookmarks for scoping log/session searches |
+
+### Sessions
+| Tool | Description |
+|------|-------------|
+| `ralph_sessions` | List recent Codex sessions |
+| `ralph_session_show` | View session messages with range filters |
+| `ralph_session_resume` | Continue a previous session |
+
+### Orchestration
+| Tool | Description |
+|------|-------------|
+| `ralph_patterns` | List orchestration patterns (triangulated review, scout-act-verify, etc.) |
+| `ralph_worker_prompt` | Generate worker prompt with standard preamble |
+
+### Autopsy (Repo Analysis)
+| Tool | Description |
+|------|-------------|
+| `autopsy_clone` | Clone/update GitHub repo for analysis |
+| `autopsy_structure` | Directory tree |
+| `autopsy_search` | Ripgrep search with regex |
+| `autopsy_ast` | AST-grep structural code search |
+| `autopsy_find` | Fast file finding with fd |
+| `autopsy_file` | Read file with optional line range |
+| `autopsy_deps` | Dependency analysis |
+| `autopsy_hotspots` | Most changed/largest files, TODOs |
+| `autopsy_stats` | Line counts by language (tokei) |
+| `autopsy_blame` | Git blame |
+| `autopsy_exports` | Map TypeScript public API |
+| `autopsy_secrets` | Scan for leaked secrets (gitleaks) |
+| `autopsy_cleanup` | Remove cloned repo from cache |
+
+## How It Works
+
+### The Iteration Loop
 
 ```
-ralph_init workdir="/path/to/project" projectName="My Project"
+prd.json → pick next story → build prompt → spawn Codex → validate → commit
+                ↑                                              │
+                └──────── update prd.json, progress.txt ───────┘
 ```
 
-Creates:
-- `prd.json` - Product requirements with stories
-- `progress.txt` - Accumulated learnings
+Each iteration:
+1. Reads `prd.json` for the highest-priority pending story
+2. Pulls hivemind context (4 queries: story relevance, failure patterns, project learnings, tech gotchas)
+3. Builds prompt with story, AGENTS.md, progress, structured context, failure pattern analysis
+4. Persists full prompt to `~/.openclaw/ralph-iterations/prompts/` (SHA-256 hash for dedup)
+5. Spawns fresh Codex session
+6. Runs validation command
+7. On success: commits, stores learning in hivemind, validates learning quality
+8. On failure: categorizes failure, stores pattern, propagates to next iteration
+9. Writes JSONL log entry to `{workdir}/.ralph-iterations.jsonl`
 
-### Add stories
+### Learning System
 
+Ralph aggressively captures and applies learnings between iterations:
+
+**Pre-iteration:** `aggressiveHivemindPull()` runs 4 targeted queries (16 results total) covering story relevance, failure patterns, project learnings, and technology gotchas.
+
+**Post-iteration:** `validateLearnings()` checks agent output for lazy patterns ("Learnings: None", vague one-liners). Lazy responses get recorded in hivemind as quality warnings.
+
+**Failure propagation:** `buildFailurePatternContext()` reads the iteration log for recurring failure categories. If the same category hits 2+ times, the prompt gets an escalation block demanding root cause analysis.
+
+**Structured context:** `.ralph-context.json` carries forward completed stories (with learnings) and failures (with categories, tool names, error details).
+
+### Iteration Log
+
+Per-project JSONL at `{workdir}/.ralph-iterations.jsonl`:
+
+```json
+{
+  "timestamp": "2026-02-08T03:00:00.000Z",
+  "epoch": 1738983600000,
+  "jobId": "ralph-abc123",
+  "storyId": "story-xyz",
+  "storyTitle": "Add user auth",
+  "codexSessionId": "session-456",
+  "codexSessionFile": "~/.codex/sessions/2026/02/08/session-456.jsonl",
+  "commitHash": "a1b2c3d",
+  "promptHash": "e4f5a6b7c8d9e0f1",
+  "promptFile": "~/.openclaw/ralph-iterations/prompts/1738983600-ralph-abc123-story-xyz.md",
+  "success": true,
+  "validationPassed": true,
+  "duration": 45000,
+  "toolCalls": 12,
+  "toolNames": ["file_edit", "shell", "write_file"],
+  "filesModified": ["src/auth.ts", "src/auth.test.ts"],
+  "model": "gpt-5.3-codex",
+  "sandbox": "danger-full-access"
+}
 ```
-ralph_add_story workdir="/path/to/project" title="Add user login" description="Implement OAuth login flow with Google" priority=1 validationCommand="npm test"
+
+Browse with:
 ```
-
-Stories are processed in priority order (lower = higher priority).
-
-### Check status
-
+ralph_iterations workdir="/path/to/project"
+ralph_iterations workdir="/path/to/project" onlyFailed=true
+ralph_iterations workdir="/path/to/project" showPrompt="story-xyz"
 ```
-ralph_status workdir="/path/to/project"
-```
-
-Shows pending/completed stories and next task.
-
-### Run single iteration
-
-```
-ralph_iterate workdir="/path/to/project"
-```
-
-Picks the next story, spawns Codex, validates, commits on success.
-
-### Run full loop
-
-```
-ralph_loop workdir="/path/to/project" maxIterations=10
-```
-
-Keeps iterating until all stories pass or limit reached.
 
 ## Configuration
 
@@ -109,108 +182,42 @@ Keeps iterating until all stories pass or limit reached.
 |--------|---------|-------------|
 | `model` | `gpt-5.2-codex` | Codex model to use |
 | `maxIterations` | `20` | Max loop iterations |
-| `sandbox` | `workspace-write` | Codex sandbox mode (`read-only`, `workspace-write`, `danger-full-access`) |
-| `autoCommit` | `true` | Auto-commit after successful iterations |
-| `debug` | `false` | Enable debug logging |
-
-## prd.json Format
-
-```json
-{
-  "version": "1.0",
-  "projectName": "My Project",
-  "description": "Project description",
-  "stories": [
-    {
-      "id": "story-abc123",
-      "title": "Add user login",
-      "description": "Implement OAuth login with Google...",
-      "priority": 1,
-      "passes": false,
-      "validationCommand": "npm test",
-      "acceptanceCriteria": [
-        "User can click 'Sign in with Google'",
-        "User is redirected back after auth"
-      ]
-    }
-  ],
-  "metadata": {
-    "createdAt": "2024-01-15T10:00:00Z",
-    "lastIteration": "2024-01-15T12:30:00Z",
-    "totalIterations": 5
-  }
-}
-```
+| `sandbox` | `danger-full-access` | Codex sandbox mode |
+| `autoCommit` | `true` | Auto-commit on success |
+| `debug` | `false` | Debug logging |
 
 ## Tips
 
-### Write granular stories
+- **Write granular stories** — one feature per story, testable in isolation
+- **Specific validation** — `npm test -- --testPathPattern=auth` beats `npm test`
+- **Use AGENTS.md** — project context helps every iteration
+- **Dry run first** — `ralph_iterate(workdir, dryRun=true)` to preview prompt and config
+- **Use async loops** — `ralph_loop` returns immediately, check with `ralph_loop_status`
+- **Browse iteration history** — `ralph_iterations` shows timing, tools, failure patterns
+- **Set cursors** — `ralph_cursor action=set label="after fix"` then filter with `sinceEpoch`
 
-Each story should fit in a single AI context window. Break down large features:
-
-❌ "Implement the entire auth system"
-
-✅ "Add login form component"
-✅ "Implement OAuth redirect handler"
-✅ "Add session persistence"
-
-### Use AGENTS.md
-
-Create an `AGENTS.md` file in your project root with:
-- Coding conventions
-- Project-specific patterns
-- Common gotchas
-
-The plugin includes this context in each iteration.
-
-### Validation commands
-
-Be specific with validation:
+## File Layout
 
 ```
-validationCommand: "npm run typecheck && npm test -- --testPathPattern=auth"
+~/.openclaw/
+  ralph-events/              # Event notification files (JSON, auto-cleaned >24h)
+  ralph-iterations/
+    prompts/                 # Full prompt text (auto-cleaned >7d)
+  ralph-cursor.json          # Timestamp bookmarks
+
+{workdir}/
+  prd.json                   # Stories and metadata
+  progress.txt               # Human-readable progress log
+  .ralph-context.json        # Machine-readable inter-story context
+  .ralph-iterations.jsonl    # Per-project iteration log
+  AGENTS.md                  # Project guidelines (included in prompts)
 ```
-
-## Progress Events
-
-The plugin emits diagnostic events during loop execution:
-
-```typescript
-// Before each iteration
-{
-  type: "ralph:iteration:start",
-  plugin: "openclaw-codex-ralph",
-  data: {
-    iteration: 1,
-    maxIterations: 10,
-    storyId: "story-abc",
-    storyTitle: "Add login form",
-    workdir: "/path/to/project"
-  }
-}
-
-// After each iteration
-{
-  type: "ralph:iteration:complete",
-  plugin: "openclaw-codex-ralph",
-  data: {
-    iteration: 1,
-    success: true,
-    toolCalls: 12,
-    filesModified: ["src/login.tsx", "src/api/auth.ts"],
-    duration: 45000,
-    storiesCompleted: 1
-  }
-}
-```
-
-For real-time progress in moltbot, you can also call `ralph_iterate` repeatedly instead of `ralph_loop` - this gives natural progress updates between iterations.
 
 ## Inspiration
 
-- [Ralph](https://github.com/snarktank/ralph) - The original autonomous AI agent loop pattern
-- [Tips for AI Coding with Ralph Wiggum](https://www.aihero.dev/tips-for-ai-coding-with-ralph-wiggum) - Practical guidance on the pattern
-- [Codex CLI](https://github.com/openai/codex) - OpenAI's coding-focused CLI
+- [Ralph](https://github.com/snarktank/ralph) — The original autonomous AI agent loop pattern
+- [Tips for AI Coding with Ralph Wiggum](https://www.aihero.dev/tips-for-ai-coding-with-ralph-wiggum) — Practical guidance on the pattern
+- [Codex CLI](https://github.com/openai/codex) — OpenAI's coding-focused CLI
 
 ## License
 

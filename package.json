@@ -1,7 +1,7 @@
 {
   "name": "openclaw-codex-ralph",
-  "version": "0.1.0",
-  "description": "Autonomous AI coding loops using Codex - run fresh AI sessions per iteration with prd.json tracking",
+  "version": "0.2.0",
+  "description": "OpenClaw plugin for autonomous AI coding loops using Codex — fresh sessions per iteration, hivemind learning, failure pattern propagation",
   "type": "module",
   "main": "index.ts",
   "openclaw": {
@@ -9,25 +9,15 @@
       "./index.ts"
     ]
   },
-  "moltbot": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
-  "clawdbot": {
-    "extensions": [
-      "./index.ts"
-    ]
-  },
   "keywords": [
     "openclaw",
-    "moltbot",
-    "clawdbot",
     "plugin",
     "codex",
     "ralph",
     "autonomous",
-    "ai-coding"
+    "ai-coding",
+    "hivemind",
+    "iteration-loop"
   ],
   "author": "Joel Hooks",
   "license": "MIT",
