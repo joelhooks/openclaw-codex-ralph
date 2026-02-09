@@ -61,15 +61,35 @@ Agents don't work in isolation:
 - Read what other agents discovered
 - Build on prior work, don't repeat it
 
-### 5. Comprehensive Logging
+### 5. Comprehensive Logging & O11y
 
-Everything observable:
-- What was attempted
-- What succeeded/failed
-- Why decisions were made
-- What was learned
+Everything observable via `.ralph-iterations.jsonl`:
 
-The coordinator (Grimlock/Moltbot) monitors the swarm. Needs visibility to coordinate effectively.
+**Per-iteration fields (as of 2026-02-09):**
+- `startedAt` / `completedAt` — precise timing
+- `stderrStats` — real Codex activity metrics:
+  - `toolCalls` — how many tools Codex invoked
+  - `fileWrites` — files actually modified
+  - `testRuns` — test executions
+  - `errorsHit` — errors encountered
+  - `timeToFirstToolCallMs` — latency to start working
+- `verificationRejectReason` — if output verifier caught lazy/mock code
+- `ghIssue` — auto-linked GitHub issue number (when `Closes #N` in commit)
+- `failureCategory` — typed: `type_error`, `test_failure`, `build_error`, `timeout`, `verification_rejected`
+- `model`, `sandbox` — configuration used
+- `iterationNumber` — global iteration counter
+
+**Key diagnostic patterns:**
+- `toolCalls == 0` on timeout → Codex thinking loop, not coding
+- `fileWrites == 0` on failure → never wrote code
+- Same `failureCategory` 3x → structural problem, needs redesign
+- `verificationRejectReason` set → caught mock/placeholder code
+
+**Event files** in `~/.openclaw/ralph-events/` for real-time monitoring (auto-cleaned after 24h).
+
+**Diagnostic events** via OpenClaw plugin SDK (`ralph:loop:{start|iteration|complete|error}`) visible in gateway diagnostic stream.
+
+The coordinator (Grimlock) monitors the swarm using these signals to intervene intelligently — not just "is it running?" but "is it actually writing good code?"
 
 ### 6. Meta-Loops
 
