@@ -31,6 +31,11 @@
         "type": "boolean",
         "default": false,
         "description": "Enable debug logging"
+      },
+      "ghIssues": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable GitHub issue tracking for Ralph loops"
       }
     },
     "additionalProperties": false
