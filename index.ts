@@ -1726,11 +1726,11 @@ async function executeRalphEditStory(params: {
 
 function sendOpenclawEvent(msg: string): void {
   try {
-    execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: "pipe",
+    const child = spawn("openclaw", ["system", "event", "--mode", "now", "--text", msg], {
+      stdio: "ignore",
+      detached: true,
     });
+    child.unref();
   } catch { /* non-fatal */ }
 }
 
