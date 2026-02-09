@@ -51,6 +51,7 @@ interface Story {
   passes: boolean;
   validationCommand?: string;
   acceptanceCriteria?: string[];
+  issueNumber?: number;
 }
 
 interface PRD {
@@ -62,6 +63,7 @@ interface PRD {
     createdAt: string;
     lastIteration?: string;
     totalIterations?: number;
+    trackingIssue?: number;
   };
 }
 
@@ -80,6 +82,8 @@ interface IterationResult {
   duration: number;
   verificationPassed?: boolean;
   verificationWarnings?: string[];
+  issueNumber?: number;
+  issueCommented?: boolean;
 }
 
 // ============================================================================
@@ -144,6 +148,9 @@ interface LoopJob {
   results: IterationResult[];
   error?: string;
   abortController?: AbortController;
+  model?: string;
+  sandbox?: string;
+  ghIssues?: boolean;
 }
 
 const activeJobs = new Map<string, LoopJob>();
@@ -167,6 +174,9 @@ function emitLoopProgress(job: LoopJob, event: "start" | "iteration" | "complete
       totalStories: job.totalStories,
       elapsedMs: Date.now() - job.startedAt,
       error: job.error,
+      model: job.model,
+      sandbox: job.sandbox,
+      ghIssues: job.ghIssues,
     },
   });
 }
@@ -198,6 +208,8 @@ interface RalphEvent {
   lastStory?: { id: string; title: string };
   results?: Array<{ storyTitle: string; success: boolean; duration: number }>;
   codexSessionId?: string;
+  issueNumber?: number;
+  verificationRejectReason?: string;
 }
 
 function writeRalphEvent(type: string, data: Partial<RalphEvent> & { jobId: string }): void {
@@ -271,6 +283,9 @@ interface IterationLogEntry {
   verificationRejectReason?: string;
   model: string;
   sandbox: string;
+  startedAt?: string;
+  completedAt?: string;
+  stderrStats?: MonitorStats;
 }
 
 function persistPrompt(jobId: string, storyId: string, prompt: string): { path: string; hash: string } {
@@ -471,6 +486,7 @@ interface RalphContextFailure {
   category: FailureCategory;
   error: string;
   toolNames?: string[];
+  iterationNumber?: number;
 }
 
 interface RalphContext {
@@ -780,6 +796,7 @@ interface PluginConfig {
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   autoCommit: boolean;
   debug: boolean;
+  ghIssues: boolean;
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
@@ -788,6 +805,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   sandbox: "danger-full-access",
   autoCommit: true,
   debug: false,
+  ghIssues: false,
 };
 
 // ============================================================================
@@ -1102,7 +1120,7 @@ function buildPreviousAttemptContext(workdir: string, storyId: string): string {
   return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string, previousBehavior?: string): string {
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string, previousBehavior?: string, issueContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1164,6 +1182,10 @@ ${previousAttemptContext}`);
 
   if (previousBehavior) {
     parts.push(`\n${previousBehavior}`);
+  }
+
+  if (issueContext) {
+    parts.push(`\n## GitHub Issue #${story.issueNumber || "?"}\n${issueContext.slice(0, 1500)}`);
   }
 
   parts.push(`\n## RULES (non-negotiable)
@@ -1533,7 +1555,7 @@ async function runCodexIteration(
 // Tool Implementations
 // ============================================================================
 
-async function executeRalphInit(params: { workdir: string; projectName: string; description?: string }) {
+async function executeRalphInit(params: { workdir: string; projectName: string; description?: string }, cfg: PluginConfig) {
   const dir = resolvePath(params.workdir);
   if (!existsSync(dir)) {
     return { error: `Directory does not exist: ${dir}` };
@@ -1557,6 +1579,16 @@ async function executeRalphInit(params: { workdir: string; projectName: string; 
 
   writePRD(params.workdir, prd);
 
+  // Create tracking issue if ghIssues enabled
+  if (cfg.ghIssues) {
+    const { createTrackingIssue } = await import("./gh-issues.js");
+    const trackingNum = createTrackingIssue(dir, prd);
+    if (trackingNum && prd.metadata) {
+      prd.metadata.trackingIssue = trackingNum;
+      writePRD(params.workdir, prd);
+    }
+  }
+
   const progressPath = join(dir, "progress.txt");
   if (!existsSync(progressPath)) {
     writeFileSync(progressPath, `# Progress Log for ${params.projectName}\n\nInitialized: ${new Date().toISOString()}\n`);
@@ -1566,6 +1598,7 @@ async function executeRalphInit(params: { workdir: string; projectName: string; 
     success: true,
     message: `Initialized Ralph project: ${params.projectName}`,
     files: ["prd.json", "progress.txt"],
+    trackingIssue: prd.metadata?.trackingIssue,
   };
 }
 
@@ -1576,7 +1609,7 @@ async function executeRalphAddStory(params: {
   priority?: number;
   validationCommand?: string;
   acceptanceCriteria?: string;
-}) {
+}, cfg: PluginConfig) {
   const prd = readPRD(params.workdir);
   if (!prd) {
     return { error: "No prd.json found. Run ralph_init first." };
@@ -1597,6 +1630,15 @@ async function executeRalphAddStory(params: {
       story.acceptanceCriteria = JSON.parse(params.acceptanceCriteria);
     } catch {
       story.acceptanceCriteria = [params.acceptanceCriteria];
+    }
+  }
+
+  // Create GH issue for the story if ghIssues enabled
+  if (cfg.ghIssues) {
+    const { createStoryIssue } = await import("./gh-issues.js");
+    const issueNum = createStoryIssue(resolvePath(params.workdir), story, prd);
+    if (issueNum) {
+      story.issueNumber = issueNum;
     }
   }
 
@@ -1709,7 +1751,12 @@ async function executeRalphIterate(
   const structuredCtx = buildStructuredContextSnippet(workdir);
   const failurePatterns = buildFailurePatternContext(workdir);
   const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap);
+  let ghIssueCtx: string | undefined;
+  if (cfg.ghIssues && story.issueNumber) {
+    const { readIssueContext } = await import("./gh-issues.js");
+    ghIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
+  }
+  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, undefined, ghIssueCtx);
 
   const iterateJobId = `iterate-${Date.now().toString(36)}`;
 
@@ -1746,6 +1793,7 @@ async function executeRalphIterate(
     duration: Date.now() - startTime,
   };
 
+  let iterateRejectReason: string | undefined;
   if (result.success) {
     // ── Output verification: catch stories that pass validation but didn't meaningfully address the work ──
     const verification = verifyOutput({
@@ -1760,6 +1808,7 @@ async function executeRalphIterate(
     if (!verification.passed) {
       // Downgrade to failure — don't commit, don't mark as passed
       result.success = false;
+      iterateRejectReason = verification.rejectReason;
       console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${verification.rejectReason}`);
       hivemindStore(
         `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${verification.rejectReason}. Checks: ${verification.checks.map(c => `[${c.severity}] ${c.name}: ${c.message}`).join("; ")}`,
@@ -1774,6 +1823,18 @@ async function executeRalphIterate(
         duration: result.duration,
         workdir,
         codexSessionId: codexResult.sessionId,
+        verificationRejectReason: verification.rejectReason,
+      });
+      emitDiagnosticEvent({
+        type: "ralph:story:verification_rejected",
+        plugin: "openclaw-codex-ralph",
+        data: {
+          jobId: iterateJobId,
+          storyId: story.id,
+          storyTitle: story.title,
+          duration: result.duration,
+          rejectReason: verification.rejectReason,
+        },
       });
     } else {
       // Log warnings if any
@@ -1817,7 +1878,8 @@ async function executeRalphIterate(
 
       // Git commit
       if (cfg.autoCommit) {
-        const hash = gitCommit(workdir, `ralph: ${story.title}`);
+        const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
+        const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
         result.commitHash = hash || undefined;
       }
 
@@ -1825,6 +1887,20 @@ async function executeRalphIterate(
       if (codexResult.sessionId) {
         const sessionFile = resolveSessionFile(codexResult.sessionId);
         if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+      }
+
+      // Close GH issue and update tracking
+      if (cfg.ghIssues && story.issueNumber) {
+        const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
+        const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
+        closeIssue(resolvePath(workdir), story.issueNumber,
+          `✅ **Completed** by Ralph loop\n\nCommit: ${result.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
+        );
+        result.issueNumber = story.issueNumber;
+        result.issueCommented = true;
+        if (prd.metadata?.trackingIssue) {
+          updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
+        }
       }
 
       // Post-success: store learning in hivemind (only if committed)
@@ -1843,6 +1919,16 @@ async function executeRalphIterate(
           `ralph,success,learning,${prd.projectName},${story.id}`
         );
       }
+
+      // Store success pattern for future iterations
+      hivemindStore(
+        `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
+        `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
+        `Duration: ${Math.round(result.duration / 1000)}s. ` +
+        `Validation: ${story.validationCommand || "default"}. ` +
+        `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
+        `ralph,success-pattern,${prd.projectName}`
+      );
 
       // Update structured context
       addContextStory(workdir, {
@@ -1873,6 +1959,19 @@ async function executeRalphIterate(
         workdir,
         codexSessionId: codexResult.sessionId,
       });
+      emitDiagnosticEvent({
+        type: "ralph:story:complete",
+        plugin: "openclaw-codex-ralph",
+        data: {
+          jobId: iterateJobId,
+          storyId: story.id,
+          storyTitle: story.title,
+          duration: result.duration,
+          commitHash: result.commitHash,
+          filesModified: codexResult.filesModified,
+          toolCalls: codexResult.toolCalls,
+        },
+      });
     }
   } else {
     // Categorize the failure
@@ -1895,6 +1994,15 @@ async function executeRalphIterate(
       `ralph,failure,${failureCategory},${prd.projectName}`
     );
 
+    // Comment failure on GH issue
+    if (cfg.ghIssues && story.issueNumber) {
+      const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
+      commentOnIssue(resolvePath(workdir), story.issueNumber,
+        `❌ **Iteration failed**\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
+      );
+      labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
+    }
+
     // Store stderr insights on failure too — helps diagnose behavioral patterns
     if (codexResult.stderrInsights) {
       hivemindStore(
@@ -1915,8 +2023,9 @@ async function executeRalphIterate(
       storyId: story.id,
       storyTitle: story.title,
       category: failureCategory,
-      error: validation.output.slice(0, 500),
+      error: iterateRejectReason ? `[verification_rejected] ${iterateRejectReason}` : validation.output.slice(0, 500),
       toolNames: extractToolNames(codexResult.events),
+      iterationNumber: prd.metadata?.totalIterations || 1,
     });
 
     // Story failure notification (with category)
@@ -1929,6 +2038,17 @@ async function executeRalphIterate(
       duration: result.duration,
       workdir,
       codexSessionId: codexResult.sessionId,
+    });
+    emitDiagnosticEvent({
+      type: "ralph:story:failed",
+      plugin: "openclaw-codex-ralph",
+      data: {
+        jobId: iterateJobId,
+        storyId: story.id,
+        storyTitle: story.title,
+        duration: result.duration,
+        failureCategory,
+      },
     });
   }
 
@@ -1959,8 +2079,12 @@ async function executeRalphIterate(
     validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
     verificationPassed: result.verificationPassed,
     verificationWarnings: result.verificationWarnings,
+    verificationRejectReason: iterateRejectReason,
     model,
     sandbox: cfg.sandbox,
+    startedAt: new Date(startTime).toISOString(),
+    completedAt: new Date().toISOString(),
+    stderrStats: codexResult.stderrStats,
   });
 
   return result;
@@ -1989,6 +2113,16 @@ async function executeRalphLoopSync(
   };
 
   let lastSyncStderrStats: MonitorStats | undefined;
+
+  // Send openclaw system event for sync loop start
+  try {
+    const startMsg = `🚀 Ralph sync loop started: max ${maxIterations} iterations`;
+    execSync(`openclaw system event --mode now --text "${startMsg.replace(/"/g, '\\"')}"`, {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: "pipe",
+    });
+  } catch { /* non-fatal */ }
 
   for (let i = 0; i < maxIterations; i++) {
     const prd = readPRD(workdir);
@@ -2020,7 +2154,12 @@ async function executeRalphLoopSync(
     const failurePatterns = buildFailurePatternContext(workdir);
     const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
     const prevBehavior = lastSyncStderrStats ? formatIterationBehavior(lastSyncStderrStats) : undefined;
-    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, prevBehavior || undefined);
+    let syncGhIssueCtx: string | undefined;
+    if (cfg.ghIssues && story.issueNumber) {
+      const { readIssueContext } = await import("./gh-issues.js");
+      syncGhIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
+    }
+    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, prevBehavior || undefined, syncGhIssueCtx);
 
     const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
     const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
@@ -2042,6 +2181,7 @@ async function executeRalphLoopSync(
       duration: Date.now() - startTime,
     };
 
+    let syncRejectReason: string | undefined;
     if (iterResult.success) {
       // ── Output verification ──
       const syncVerification = verifyOutput({
@@ -2055,6 +2195,7 @@ async function executeRalphLoopSync(
 
       if (!syncVerification.passed) {
         iterResult.success = false;
+        syncRejectReason = syncVerification.rejectReason;
         console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${syncVerification.rejectReason}`);
         hivemindStore(
           `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${syncVerification.rejectReason}`,
@@ -2069,6 +2210,18 @@ async function executeRalphLoopSync(
           duration: iterResult.duration,
           workdir,
           codexSessionId: codexResult.sessionId,
+          verificationRejectReason: syncVerification.rejectReason,
+        });
+        emitDiagnosticEvent({
+          type: "ralph:story:verification_rejected",
+          plugin: "openclaw-codex-ralph",
+          data: {
+            jobId: syncJobId,
+            storyId: story.id,
+            storyTitle: story.title,
+            duration: iterResult.duration,
+            rejectReason: syncVerification.rejectReason,
+          },
         });
         // Fall through to failure handling below
       } else {
@@ -2105,7 +2258,8 @@ async function executeRalphLoopSync(
         }
 
         if (cfg.autoCommit) {
-          const hash = gitCommit(workdir, `ralph: ${story.title}`);
+          const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
+          const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
           iterResult.commitHash = hash || undefined;
         }
 
@@ -2113,6 +2267,20 @@ async function executeRalphLoopSync(
         if (codexResult.sessionId) {
           const sessionFile = resolveSessionFile(codexResult.sessionId);
           if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+        }
+
+        // Close GH issue and update tracking
+        if (cfg.ghIssues && story.issueNumber) {
+          const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
+          const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
+          closeIssue(resolvePath(workdir), story.issueNumber,
+            `✅ **Completed** by Ralph loop\n\nCommit: ${iterResult.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
+          );
+          iterResult.issueNumber = story.issueNumber;
+          iterResult.issueCommented = true;
+          if (prd.metadata?.trackingIssue) {
+            updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
+          }
         }
 
         // Post-success: store learning in hivemind
@@ -2132,6 +2300,16 @@ async function executeRalphLoopSync(
           );
         }
 
+        // Store success pattern for future iterations
+        hivemindStore(
+          `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
+          `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
+          `Duration: ${Math.round(iterResult.duration / 1000)}s. ` +
+          `Validation: ${story.validationCommand || "default"}. ` +
+          `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
+          `ralph,success-pattern,${prd.projectName}`
+        );
+
         // Update structured context
         addContextStory(workdir, {
           id: story.id,
@@ -2148,6 +2326,21 @@ async function executeRalphLoopSync(
             `ralph,session-insight,${prd.projectName}`
           );
         }
+
+        // Story complete diagnostic event
+        emitDiagnosticEvent({
+          type: "ralph:story:complete",
+          plugin: "openclaw-codex-ralph",
+          data: {
+            jobId: syncJobId,
+            storyId: story.id,
+            storyTitle: story.title,
+            duration: iterResult.duration,
+            commitHash: iterResult.commitHash,
+            filesModified: codexResult.filesModified,
+            toolCalls: codexResult.toolCalls,
+          },
+        });
       }
     }
 
@@ -2171,6 +2364,15 @@ async function executeRalphLoopSync(
         );
       }
 
+      // Comment failure on GH issue
+      if (cfg.ghIssues && story.issueNumber) {
+        const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
+        commentOnIssue(resolvePath(workdir), story.issueNumber,
+          `❌ **Iteration failed** (attempt ${retryTracker.getFailCount(story.id)}/${DEFAULT_MAX_RETRIES})\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
+        );
+        labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
+      }
+
       // Store stderr insights on failure
       if (codexResult.stderrInsights) {
         hivemindStore(
@@ -2191,8 +2393,22 @@ async function executeRalphLoopSync(
         storyId: story.id,
         storyTitle: story.title,
         category: failureCategory,
-        error: validation.output.slice(0, 500),
+        error: syncRejectReason ? `[verification_rejected] ${syncRejectReason}` : validation.output.slice(0, 500),
         toolNames: extractToolNames(codexResult.events),
+        iterationNumber: i + 1,
+      });
+
+      // Story failed diagnostic event
+      emitDiagnosticEvent({
+        type: "ralph:story:failed",
+        plugin: "openclaw-codex-ralph",
+        data: {
+          jobId: syncJobId,
+          storyId: story.id,
+          storyTitle: story.title,
+          duration: iterResult.duration,
+          failureCategory,
+        },
       });
 
       if (stopOnFailure) {
@@ -2222,8 +2438,12 @@ async function executeRalphLoopSync(
           validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
           verificationPassed: iterResult.verificationPassed,
           verificationWarnings: iterResult.verificationWarnings,
+          verificationRejectReason: syncRejectReason,
           model,
           sandbox: cfg.sandbox,
+          startedAt: new Date(startTime).toISOString(),
+          completedAt: new Date().toISOString(),
+          stderrStats: codexResult.stderrStats,
         });
         loopResult.stoppedReason = "failure";
         loopResult.results.push(iterResult);
@@ -2258,8 +2478,12 @@ async function executeRalphLoopSync(
       validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
       verificationPassed: iterResult.verificationPassed,
       verificationWarnings: iterResult.verificationWarnings,
+      verificationRejectReason: syncRejectReason,
       model,
       sandbox: cfg.sandbox,
+      startedAt: new Date(startTime).toISOString(),
+      completedAt: new Date().toISOString(),
+      stderrStats: codexResult.stderrStats,
     });
 
     loopResult.results.push(iterResult);
@@ -2300,6 +2524,16 @@ async function executeRalphLoopAsync(
   cleanupOldEvents();
   cleanupOldPrompts();
   writeRalphEvent("loop_start", { jobId: job.id, totalStories: job.totalStories, workdir });
+
+  // Send openclaw system event for loop start
+  try {
+    const startMsg = `🚀 Ralph loop started: ${job.totalStories} stories, max ${maxIterations} iterations`;
+    execSync(`openclaw system event --mode now --text "${startMsg.replace(/"/g, '\\"')}"`, {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: "pipe",
+    });
+  } catch { /* non-fatal */ }
 
   let lastAsyncStderrStats: MonitorStats | undefined;
 
@@ -2362,7 +2596,12 @@ async function executeRalphLoopAsync(
       const failurePatterns = buildFailurePatternContext(workdir);
       const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
       const asyncPrevBehavior = lastAsyncStderrStats ? formatIterationBehavior(lastAsyncStderrStats) : undefined;
-      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, asyncPrevBehavior || undefined);
+      let asyncGhIssueCtx: string | undefined;
+      if (cfg.ghIssues && story.issueNumber) {
+        const { readIssueContext } = await import("./gh-issues.js");
+        asyncGhIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
+      }
+      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, asyncPrevBehavior || undefined, asyncGhIssueCtx);
 
       // Persist prompt to disk
       const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
@@ -2386,6 +2625,7 @@ async function executeRalphLoopAsync(
 
       job.results.push(iterResult);
 
+      let asyncRejectReason: string | undefined;
       if (iterResult.success) {
         // ── Output verification ──
         const asyncVerification = verifyOutput({
@@ -2399,6 +2639,7 @@ async function executeRalphLoopAsync(
 
         if (!asyncVerification.passed) {
           iterResult.success = false;
+          asyncRejectReason = asyncVerification.rejectReason;
           console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${asyncVerification.rejectReason}`);
           hivemindStore(
             `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${asyncVerification.rejectReason}`,
@@ -2413,6 +2654,18 @@ async function executeRalphLoopAsync(
             duration: iterResult.duration,
             workdir,
             codexSessionId: codexResult.sessionId,
+            verificationRejectReason: asyncVerification.rejectReason,
+          });
+          emitDiagnosticEvent({
+            type: "ralph:story:verification_rejected",
+            plugin: "openclaw-codex-ralph",
+            data: {
+              jobId: job.id,
+              storyId: story.id,
+              storyTitle: story.title,
+              duration: iterResult.duration,
+              rejectReason: asyncVerification.rejectReason,
+            },
           });
           // Fall through to failure handling below
         } else {
@@ -2449,7 +2702,8 @@ async function executeRalphLoopAsync(
           }
 
           if (cfg.autoCommit) {
-            const hash = gitCommit(workdir, `ralph: ${story.title}`);
+            const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
+            const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
             iterResult.commitHash = hash || undefined;
           }
 
@@ -2457,6 +2711,20 @@ async function executeRalphLoopAsync(
           if (codexResult.sessionId) {
             const sessionFile = resolveSessionFile(codexResult.sessionId);
             if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+          }
+
+          // Close GH issue and update tracking
+          if (cfg.ghIssues && story.issueNumber) {
+            const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
+            const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
+            closeIssue(resolvePath(workdir), story.issueNumber,
+              `✅ **Completed** by Ralph loop\n\nCommit: ${iterResult.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
+            );
+            iterResult.issueNumber = story.issueNumber;
+            iterResult.issueCommented = true;
+            if (prd.metadata?.trackingIssue) {
+              updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
+            }
           }
 
           // Post-success: store learning in hivemind (only if committed)
@@ -2475,6 +2743,16 @@ async function executeRalphLoopAsync(
               `ralph,success,learning,${prd.projectName},${story.id}`
             );
           }
+
+          // Store success pattern for future iterations
+          hivemindStore(
+            `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
+            `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
+            `Duration: ${Math.round(iterResult.duration / 1000)}s. ` +
+            `Validation: ${story.validationCommand || "default"}. ` +
+            `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
+            `ralph,success-pattern,${prd.projectName}`
+          );
 
           // Update structured context
           addContextStory(workdir, {
@@ -2504,6 +2782,19 @@ async function executeRalphLoopAsync(
             summary: codexResult.finalMessage.slice(0, 500),
             workdir,
             codexSessionId: codexResult.sessionId,
+          });
+          emitDiagnosticEvent({
+            type: "ralph:story:complete",
+            plugin: "openclaw-codex-ralph",
+            data: {
+              jobId: job.id,
+              storyId: story.id,
+              storyTitle: story.title,
+              duration: iterResult.duration,
+              commitHash: iterResult.commitHash,
+              filesModified: codexResult.filesModified,
+              toolCalls: codexResult.toolCalls,
+            },
           });
 
           emitLoopProgress(job, "iteration");
@@ -2542,6 +2833,15 @@ async function executeRalphLoopAsync(
           );
         }
 
+        // Comment failure on GH issue
+        if (cfg.ghIssues && story.issueNumber) {
+          const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
+          commentOnIssue(resolvePath(workdir), story.issueNumber,
+            `❌ **Iteration failed** (attempt ${retryTracker.getFailCount(story.id)}/${DEFAULT_MAX_RETRIES})\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
+          );
+          labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
+        }
+
         // Store stderr insights on failure
         if (codexResult.stderrInsights) {
           hivemindStore(
@@ -2562,8 +2862,9 @@ async function executeRalphLoopAsync(
           storyId: story.id,
           storyTitle: story.title,
           category: failureCategory,
-          error: validation.output.slice(0, 500),
+          error: asyncRejectReason ? `[verification_rejected] ${asyncRejectReason}` : validation.output.slice(0, 500),
           toolNames: extractToolNames(codexResult.events),
+          iterationNumber: i + 1,
         });
 
         // Story failure notification (with category)
@@ -2576,6 +2877,17 @@ async function executeRalphLoopAsync(
           duration: iterResult.duration,
           workdir,
           codexSessionId: codexResult.sessionId,
+        });
+        emitDiagnosticEvent({
+          type: "ralph:story:failed",
+          plugin: "openclaw-codex-ralph",
+          data: {
+            jobId: job.id,
+            storyId: story.id,
+            storyTitle: story.title,
+            duration: iterResult.duration,
+            failureCategory,
+          },
         });
 
         // Send openclaw system event for failure
@@ -2615,8 +2927,12 @@ async function executeRalphLoopAsync(
             validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
             verificationPassed: iterResult.verificationPassed,
             verificationWarnings: iterResult.verificationWarnings,
+            verificationRejectReason: asyncRejectReason,
             model: loopCfg.model,
             sandbox: cfg.sandbox,
+            startedAt: new Date(startTime).toISOString(),
+            completedAt: new Date().toISOString(),
+            stderrStats: codexResult.stderrStats,
           });
           job.status = "failed";
           job.error = `Story failed: ${story.title}`;
@@ -2662,8 +2978,12 @@ async function executeRalphLoopAsync(
         validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
         verificationPassed: iterResult.verificationPassed,
         verificationWarnings: iterResult.verificationWarnings,
+        verificationRejectReason: asyncRejectReason,
         model: loopCfg.model,
         sandbox: cfg.sandbox,
+        startedAt: new Date(startTime).toISOString(),
+        completedAt: new Date().toISOString(),
+        stderrStats: codexResult.stderrStats,
       });
     }
 
@@ -2741,6 +3061,9 @@ function startLoopJob(
     storiesCompleted: 0,
     totalStories,
     results: [],
+    model: cfg.model,
+    sandbox: cfg.sandbox,
+    ghIssues: cfg.ghIssues,
   };
 
   activeJobs.set(job.id, job);
@@ -2798,7 +3121,7 @@ const ralphCodexPlugin = {
         additionalProperties: false,
       },
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-        const result = await executeRalphInit(params as Parameters<typeof executeRalphInit>[0]);
+        const result = await executeRalphInit(params as Parameters<typeof executeRalphInit>[0], cfg);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       },
     });
@@ -2822,7 +3145,7 @@ const ralphCodexPlugin = {
         additionalProperties: false,
       },
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
-        const result = await executeRalphAddStory(params as Parameters<typeof executeRalphAddStory>[0]);
+        const result = await executeRalphAddStory(params as Parameters<typeof executeRalphAddStory>[0], cfg);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       },
     });
@@ -2871,6 +3194,68 @@ const ralphCodexPlugin = {
       },
     });
 
+    // ralph_link_issues — bulk-create GH issues for existing PRDs
+    api.registerTool({
+      name: "ralph_link_issues",
+      label: "Ralph Link Issues",
+      description: "Create GitHub issues for all stories in prd.json that don't have issue numbers yet. Optionally creates a tracking issue.",
+      parameters: {
+        type: "object",
+        properties: {
+          workdir: { type: "string", description: "Project directory (required)" },
+          createTracking: { type: "boolean", description: "Also create a tracking issue if none exists (default: true)" },
+        },
+        required: ["workdir"],
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        const workdir = params.workdir as string;
+        const createTracking = params.createTracking !== false;
+        const prd = readPRD(workdir);
+        if (!prd) {
+          return { content: [{ type: "text", text: JSON.stringify({ error: "No prd.json found. Run ralph_init first." }) }] };
+        }
+
+        const { createStoryIssue, createTrackingIssue, updateTrackingChecklist } = await import("./gh-issues.js");
+        const dir = resolvePath(workdir);
+        let created = 0;
+
+        for (const story of prd.stories) {
+          if (!story.issueNumber) {
+            const issueNum = createStoryIssue(dir, story, prd);
+            if (issueNum) {
+              story.issueNumber = issueNum;
+              created++;
+            }
+          }
+        }
+
+        if (createTracking && !prd.metadata?.trackingIssue) {
+          prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+          const trackingNum = createTrackingIssue(dir, prd);
+          if (trackingNum) {
+            prd.metadata.trackingIssue = trackingNum;
+          }
+        } else if (prd.metadata?.trackingIssue) {
+          updateTrackingChecklist(dir, prd.metadata.trackingIssue, prd);
+        }
+
+        writePRD(workdir, prd);
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              success: true,
+              issuesCreated: created,
+              trackingIssue: prd.metadata?.trackingIssue,
+              stories: prd.stories.map((s) => ({ id: s.id, title: s.title, issueNumber: s.issueNumber })),
+            }, null, 2),
+          }],
+        };
+      },
+    });
+
     // ralph_iterate
     api.registerTool({
       name: "ralph_iterate",
@@ -2905,19 +3290,23 @@ const ralphCodexPlugin = {
           model: { type: "string", description: "Override model for iterations" },
           stopOnFailure: { type: "boolean", description: "Stop loop on first failure (default: false)" },
           sync: { type: "boolean", description: "Run synchronously (blocks until complete, legacy behavior)" },
+          ghIssues: { type: "boolean", description: "Enable GitHub issue tracking for this loop run" },
         },
         required: ["workdir"],
         additionalProperties: false,
       },
       execute: async (_toolCallId: string, params: Record<string, unknown>) => {
+        // Allow per-invocation ghIssues override
+        const loopCfg = params.ghIssues !== undefined ? { ...cfg, ghIssues: params.ghIssues as boolean } : cfg;
+
         // Legacy sync mode for backward compat
         if (params.sync) {
-          const result = await executeRalphLoopSync(params as Parameters<typeof executeRalphLoopSync>[0], cfg);
+          const result = await executeRalphLoopSync(params as Parameters<typeof executeRalphLoopSync>[0], loopCfg);
           return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         }
 
         // New async mode - returns immediately
-        const job = startLoopJob(params as Parameters<typeof startLoopJob>[0], cfg);
+        const job = startLoopJob(params as Parameters<typeof startLoopJob>[0], loopCfg);
         return {
           content: [{
             type: "text",
@@ -3675,7 +4064,7 @@ const ralphCodexPlugin = {
       },
     });
 
-    console.log(`[openclaw-codex-ralph] Registered 26 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox})`);
+    console.log(`[openclaw-codex-ralph] Registered 27 tools (model: ${cfg.model}, sandbox: ${cfg.sandbox}, ghIssues: ${cfg.ghIssues})`);
   },
 };
 
