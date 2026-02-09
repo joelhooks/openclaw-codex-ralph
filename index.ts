@@ -1720,107 +1720,122 @@ async function executeRalphEditStory(params: {
   };
 }
 
-async function executeRalphIterate(
-  params: { workdir: string; model?: string; dryRun?: boolean },
-  cfg: PluginConfig
-): Promise<IterationResult | { dryRun: true; story: { id: string; title: string }; promptLength: number; promptFile: string; promptHash: string; model: string; sandbox: string } | { success: true; message: string; storiesCompleted: number } | { error: string }> {
-  const workdir = params.workdir;
-  const model = params.model || cfg.model;
-  const dryRun = params.dryRun;
+// ============================================================================
+// Shared Helpers (used by all 3 loop variants)
+// ============================================================================
 
-  const startTime = Date.now();
+function sendOpenclawEvent(msg: string): void {
+  try {
+    execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
+      encoding: "utf-8",
+      timeout: 10000,
+      stdio: "pipe",
+    });
+  } catch { /* non-fatal */ }
+}
 
+type IterationContextResult =
+  | { allDone: true; prd: PRD }
+  | { error: string }
+  | { prd: PRD; story: Story; prompt: string; promptFile: string; promptHash: string; jobId: string };
+
+async function buildIterationContext(
+  workdir: string,
+  cfg: PluginConfig,
+  jobId: string,
+  previousStderrStats?: MonitorStats
+): Promise<IterationContextResult> {
   const prd = readPRD(workdir);
-  if (!prd) {
-    return { error: "No prd.json found" };
-  }
+  if (!prd) return { error: "No prd.json found" };
 
   const story = getNextStory(prd);
-  if (!story) {
-    return { success: true, message: "All stories complete!", storiesCompleted: prd.stories.length };
-  }
+  if (!story) return { allDone: true, prd };
 
   const progress = readProgress(workdir);
-
-  // Pre-iteration: generate codebase map so Codex doesn't waste time exploring
   const codebaseMap = generateCodebaseMap(workdir);
-
-  // Pre-iteration: query hivemind for relevant prior learnings
   const hivemindContext = aggressiveHivemindPull(story, prd, workdir);
-  // Read structured context from .ralph-context.json
   const structuredCtx = buildStructuredContextSnippet(workdir);
   const failurePatterns = buildFailurePatternContext(workdir);
   const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
+  const prevBehavior = previousStderrStats ? formatIterationBehavior(previousStderrStats) : undefined;
+
   let ghIssueCtx: string | undefined;
   if (cfg.ghIssues && story.issueNumber) {
     const { readIssueContext } = await import("./gh-issues.js");
     ghIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
   }
-  const prompt = buildIterationPrompt(prd, story, progress, hivemindContext || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, undefined, ghIssueCtx);
 
-  const iterateJobId = `iterate-${Date.now().toString(36)}`;
+  const prompt = buildIterationPrompt(
+    prd, story, progress,
+    hivemindContext || undefined, structuredCtx || undefined,
+    failurePatterns || undefined, prevAttemptCtx || undefined,
+    codebaseMap, prevBehavior || undefined, ghIssueCtx
+  );
 
-  // Persist prompt to disk
-  const { path: promptFile, hash: promptHash } = persistPrompt(iterateJobId, story.id, prompt);
+  const { path: promptFile, hash: promptHash } = persistPrompt(jobId, story.id, prompt);
 
-  if (dryRun) {
-    return {
-      dryRun: true,
-      story: { id: story.id, title: story.title },
-      promptLength: prompt.length,
-      promptFile,
-      promptHash,
-      model,
-      sandbox: cfg.sandbox,
-    };
-  }
+  return { prd, story, prompt, promptFile, promptHash, jobId };
+}
 
-  // Run Codex
-  const codexResult = await runCodexIteration(workdir, prompt, { ...cfg, model });
+interface RunResult {
+  iterResult: IterationResult;
+  codexResult: CodexIterationResult;
+  validation: { success: boolean; output: string };
+  rejectReason?: string;
+  startTime: number;
+}
 
-  // Run validation
+async function runAndValidateIteration(
+  workdir: string,
+  prompt: string,
+  story: Story,
+  cfg: PluginConfig,
+  outputTruncation: number,
+  jobId: string,
+  prd: PRD
+): Promise<RunResult> {
+  const startTime = Date.now();
+  const codexResult = await runCodexIteration(workdir, prompt, cfg);
   const validation = runValidation(workdir, story.validationCommand);
 
-  const result: IterationResult = {
+  const iterResult: IterationResult = {
     success: codexResult.success && validation.success,
     storyId: story.id,
     storyTitle: story.title,
     validationPassed: validation.success,
-    codexOutput: codexResult.output.slice(0, 2000),
-    codexFinalMessage: codexResult.finalMessage.slice(0, 2000),
+    codexOutput: codexResult.output.slice(0, outputTruncation),
+    codexFinalMessage: codexResult.finalMessage.slice(0, outputTruncation),
     toolCalls: codexResult.toolCalls,
     filesModified: codexResult.filesModified,
     duration: Date.now() - startTime,
   };
 
-  let iterateRejectReason: string | undefined;
-  if (result.success) {
-    // ── Output verification: catch stories that pass validation but didn't meaningfully address the work ──
+  let rejectReason: string | undefined;
+  if (iterResult.success) {
     const verification = verifyOutput({
       workdir: resolvePath(workdir),
       story,
       codexResult,
       validationOutput: validation.output,
     });
-    result.verificationPassed = verification.passed;
-    result.verificationWarnings = verification.warnings.length > 0 ? verification.warnings : undefined;
+    iterResult.verificationPassed = verification.passed;
+    iterResult.verificationWarnings = verification.warnings.length > 0 ? verification.warnings : undefined;
 
     if (!verification.passed) {
-      // Downgrade to failure — don't commit, don't mark as passed
-      result.success = false;
-      iterateRejectReason = verification.rejectReason;
+      iterResult.success = false;
+      rejectReason = verification.rejectReason;
       console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${verification.rejectReason}`);
       hivemindStore(
         `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${verification.rejectReason}. Checks: ${verification.checks.map(c => `[${c.severity}] ${c.name}: ${c.message}`).join("; ")}`,
         `ralph,verification,rejected,${prd.projectName}`
       );
       writeRalphEvent("story_verification_rejected", {
-        jobId: iterateJobId,
+        jobId,
         storyId: story.id,
         storyTitle: story.title,
         error: verification.rejectReason || "Verification failed",
         failureCategory: "verification_rejected",
-        duration: result.duration,
+        duration: iterResult.duration,
         workdir,
         codexSessionId: codexResult.sessionId,
         verificationRejectReason: verification.rejectReason,
@@ -1828,266 +1843,328 @@ async function executeRalphIterate(
       emitDiagnosticEvent({
         type: "ralph:story:verification_rejected",
         plugin: "openclaw-codex-ralph",
-        data: {
-          jobId: iterateJobId,
-          storyId: story.id,
-          storyTitle: story.title,
-          duration: result.duration,
-          rejectReason: verification.rejectReason,
-        },
+        data: { jobId, storyId: story.id, storyTitle: story.title, duration: iterResult.duration, rejectReason: verification.rejectReason },
       });
-    } else {
-      // Log warnings if any
-      if (verification.warnings.length > 0) {
-        console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${verification.warnings.join("; ")}`);
-        hivemindStore(
-          `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${verification.warnings.join("; ")}`,
-          `ralph,verification,warning,${prd.projectName}`
-        );
-      }
-
-      // Mark story as passed
-      story.passes = true;
-      prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-      prd.metadata.lastIteration = new Date().toISOString();
-      prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-      writePRD(workdir, prd);
-
-      // Append to progress with final message
-      const summary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 800);
-      const progressEntry = [
-        `Completed: ${story.title}`,
-        `Files modified: ${codexResult.filesModified.join(", ") || "none"}`,
-        `Tool calls: ${codexResult.toolCalls}`,
-        `Validation: ${story.validationCommand || "default"}`,
-        `Summary: ${summary}`,
-      ].join("\n");
-      // Validate learning quality
-      const learningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-      if (!learningCheck.valid) {
-        console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
-        appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
-        // Record laziness in hivemind so future iterations see the pattern
-        hivemindStore(
-          `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${learningCheck.reason}. This is a recurring quality issue — agents must provide structured learnings.`,
-          `ralph,laziness,quality,${prd.projectName}`
-        );
-      } else {
-        appendProgress(workdir, progressEntry);
-      }
-
-      // Git commit
-      if (cfg.autoCommit) {
-        const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
-        const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
-        result.commitHash = hash || undefined;
-      }
-
-      // Enrich codebase map from session (post-commit)
-      if (codexResult.sessionId) {
-        const sessionFile = resolveSessionFile(codexResult.sessionId);
-        if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
-      }
-
-      // Close GH issue and update tracking
-      if (cfg.ghIssues && story.issueNumber) {
-        const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
-        const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
-        closeIssue(resolvePath(workdir), story.issueNumber,
-          `✅ **Completed** by Ralph loop\n\nCommit: ${result.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
-        );
-        result.issueNumber = story.issueNumber;
-        result.issueCommented = true;
-        if (prd.metadata?.trackingIssue) {
-          updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
-        }
-      }
-
-      // Post-success: store learning in hivemind (only if committed)
-      if (result.commitHash) {
-        hivemindStore(
-          `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-          `ralph,learning,${prd.projectName}`
-        );
-      }
-
-      // Store extracted learnings in hivemind (regardless of commit — learnings are always valuable)
-      const iterateLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-      if (iterateLearnings && iterateLearnings.length >= 50) {
-        hivemindStore(
-          `Learnings from "${story.title}": ${iterateLearnings}`,
-          `ralph,success,learning,${prd.projectName},${story.id}`
-        );
-      }
-
-      // Store success pattern for future iterations
+    } else if (verification.warnings.length > 0) {
+      console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${verification.warnings.join("; ")}`);
       hivemindStore(
-        `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
-        `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
-        `Duration: ${Math.round(result.duration / 1000)}s. ` +
-        `Validation: ${story.validationCommand || "default"}. ` +
-        `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
-        `ralph,success-pattern,${prd.projectName}`
+        `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${verification.warnings.join("; ")}`,
+        `ralph,verification,warning,${prd.projectName}`
       );
-
-      // Update structured context
-      addContextStory(workdir, {
-        id: story.id,
-        title: story.title,
-        status: "completed",
-        filesModified: codexResult.filesModified,
-        learnings: iterateLearnings || codexResult.finalMessage.slice(0, 500),
-      });
-
-      // Store stderr insights for behavioral analysis
-      if (codexResult.stderrInsights) {
-        hivemindStore(
-          `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-          `ralph,session-insight,${prd.projectName}`
-        );
-      }
-
-      // Story complete notification
-      writeRalphEvent("story_complete", {
-        jobId: iterateJobId,
-        storyId: story.id,
-        storyTitle: story.title,
-        filesModified: codexResult.filesModified,
-        commitHash: result.commitHash,
-        duration: result.duration,
-        summary: codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 500),
-        workdir,
-        codexSessionId: codexResult.sessionId,
-      });
-      emitDiagnosticEvent({
-        type: "ralph:story:complete",
-        plugin: "openclaw-codex-ralph",
-        data: {
-          jobId: iterateJobId,
-          storyId: story.id,
-          storyTitle: story.title,
-          duration: result.duration,
-          commitHash: result.commitHash,
-          filesModified: codexResult.filesModified,
-          toolCalls: codexResult.toolCalls,
-        },
-      });
     }
+  }
+
+  return { iterResult, codexResult, validation, rejectReason, startTime };
+}
+
+interface SuccessContext {
+  workdir: string;
+  prd: PRD;
+  story: Story;
+  iterResult: IterationResult;
+  codexResult: CodexIterationResult;
+  jobId: string;
+  cfg: PluginConfig;
+}
+
+async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
+  const { workdir, prd, story, iterResult, codexResult, jobId, cfg } = ctx;
+
+  story.passes = true;
+  prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
+  prd.metadata.lastIteration = new Date().toISOString();
+  prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
+  writePRD(workdir, prd);
+
+  const summary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 800);
+  const progressEntry = [
+    `Completed: ${story.title}`,
+    `Files: ${codexResult.filesModified.join(", ") || "none"}`,
+    `Summary: ${summary}`,
+  ].join("\n");
+
+  const learningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
+  if (!learningCheck.valid) {
+    console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${learningCheck.reason}`);
+    appendProgress(workdir, progressEntry + `\n⚠️ LAZY LEARNINGS: ${learningCheck.reason}`);
+    hivemindStore(
+      `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${learningCheck.reason}. This is a recurring quality issue — agents must provide structured learnings.`,
+      `ralph,laziness,quality,${prd.projectName}`
+    );
   } else {
-    // Categorize the failure
-    const failureCategory = categorizeFailure(validation.output);
+    appendProgress(workdir, progressEntry);
+  }
 
-    // Log failure with details
-    const failureEntry = [
-      `Failed: ${story.title} [${failureCategory}]`,
-      `Codex success: ${codexResult.success}`,
-      `Validation success: ${validation.success}`,
-      `Files touched: ${codexResult.filesModified.join(", ") || "none"}`,
-      `Validation output: ${validation.output.slice(0, 500)}`,
-      `Codex message: ${codexResult.finalMessage.slice(0, 500)}`,
-    ].join("\n");
-    appendProgress(workdir, failureEntry);
+  if (cfg.autoCommit) {
+    const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
+    const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
+    iterResult.commitHash = hash || undefined;
+  }
 
-    // Store failure pattern in hivemind (with category)
+  if (codexResult.sessionId) {
+    const sessionFile = resolveSessionFile(codexResult.sessionId);
+    if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
+  }
+
+  if (cfg.ghIssues && story.issueNumber) {
+    const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
+    const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
+    closeIssue(resolvePath(workdir), story.issueNumber,
+      `✅ **Completed** by Ralph loop\n\nCommit: ${iterResult.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
+    );
+    iterResult.issueNumber = story.issueNumber;
+    iterResult.issueCommented = true;
+    if (prd.metadata?.trackingIssue) {
+      updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
+    }
+  }
+
+  if (iterResult.commitHash) {
+    hivemindStore(
+      `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
+      `ralph,learning,${prd.projectName}`
+    );
+  }
+
+  const learnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
+  if (learnings && learnings.length >= 50) {
+    hivemindStore(
+      `Learnings from "${story.title}": ${learnings}`,
+      `ralph,success,learning,${prd.projectName},${story.id}`
+    );
+  }
+
+  hivemindStore(
+    `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
+    `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
+    `Duration: ${Math.round(iterResult.duration / 1000)}s. ` +
+    `Validation: ${story.validationCommand || "default"}. ` +
+    `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
+    `ralph,success-pattern,${prd.projectName}`
+  );
+
+  addContextStory(workdir, {
+    id: story.id,
+    title: story.title,
+    status: "completed",
+    filesModified: codexResult.filesModified,
+    learnings: learnings || codexResult.finalMessage.slice(0, 500),
+  });
+
+  if (codexResult.stderrInsights) {
+    hivemindStore(
+      `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
+      `ralph,session-insight,${prd.projectName}`
+    );
+  }
+
+  writeRalphEvent("story_complete", {
+    jobId,
+    storyId: story.id,
+    storyTitle: story.title,
+    filesModified: codexResult.filesModified,
+    commitHash: iterResult.commitHash,
+    duration: iterResult.duration,
+    summary: codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 500),
+    workdir,
+    codexSessionId: codexResult.sessionId,
+  });
+  emitDiagnosticEvent({
+    type: "ralph:story:complete",
+    plugin: "openclaw-codex-ralph",
+    data: {
+      jobId,
+      storyId: story.id,
+      storyTitle: story.title,
+      duration: iterResult.duration,
+      commitHash: iterResult.commitHash,
+      filesModified: codexResult.filesModified,
+      toolCalls: codexResult.toolCalls,
+    },
+  });
+  sendOpenclawEvent(`✅ Story complete: ${story.title}${iterResult.commitHash ? ` (${iterResult.commitHash})` : ""}`);
+}
+
+interface FailureContext {
+  workdir: string;
+  prd: PRD;
+  story: Story;
+  iterResult: IterationResult;
+  codexResult: CodexIterationResult;
+  validation: { success: boolean; output: string };
+  rejectReason?: string;
+  jobId: string;
+  cfg: PluginConfig;
+  iterationNumber: number;
+  retryCount?: number;
+}
+
+async function handleIterationFailure(ctx: FailureContext): Promise<FailureCategory> {
+  const { workdir, prd, story, iterResult, codexResult, validation, rejectReason, jobId, cfg, iterationNumber, retryCount } = ctx;
+
+  const failureCategory: FailureCategory = iterResult.verificationPassed === false
+    ? "verification_rejected"
+    : categorizeFailure(validation.output);
+
+  const failEntry = [
+    `Failed: ${story.title} [${failureCategory}]`,
+    `Validation: ${validation.output.slice(0, 300)}`,
+    `Codex: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
+  ].join("\n");
+  appendProgress(workdir, failEntry);
+
+  if (failureCategory !== "verification_rejected") {
     hivemindStore(
       `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
       `ralph,failure,${failureCategory},${prd.projectName}`
     );
-
-    // Comment failure on GH issue
-    if (cfg.ghIssues && story.issueNumber) {
-      const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
-      commentOnIssue(resolvePath(workdir), story.issueNumber,
-        `❌ **Iteration failed**\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
-      );
-      labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
-    }
-
-    // Store stderr insights on failure too — helps diagnose behavioral patterns
-    if (codexResult.stderrInsights) {
-      hivemindStore(
-        `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
-        `ralph,session-insight,failure,${prd.projectName}`
-      );
-    }
-
-    // Update structured context with failure
-    addContextStory(workdir, {
-      id: story.id,
-      title: story.title,
-      status: "failed",
-      filesModified: codexResult.filesModified,
-      learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
-    });
-    addContextFailure(workdir, {
-      storyId: story.id,
-      storyTitle: story.title,
-      category: failureCategory,
-      error: iterateRejectReason ? `[verification_rejected] ${iterateRejectReason}` : validation.output.slice(0, 500),
-      toolNames: extractToolNames(codexResult.events),
-      iterationNumber: prd.metadata?.totalIterations || 1,
-    });
-
-    // Story failure notification (with category)
-    writeRalphEvent("story_failed", {
-      jobId: iterateJobId,
-      storyId: story.id,
-      storyTitle: story.title,
-      error: validation.output.slice(0, 500),
-      failureCategory: failureCategory,
-      duration: result.duration,
-      workdir,
-      codexSessionId: codexResult.sessionId,
-    });
-    emitDiagnosticEvent({
-      type: "ralph:story:failed",
-      plugin: "openclaw-codex-ralph",
-      data: {
-        jobId: iterateJobId,
-        storyId: story.id,
-        storyTitle: story.title,
-        duration: result.duration,
-        failureCategory,
-      },
-    });
   }
 
-  // Write iteration log entry
-  const iterFailCat = result.success ? undefined : (result.verificationPassed === false ? "verification_rejected" as FailureCategory : categorizeFailure(validation.output));
+  if (cfg.ghIssues && story.issueNumber) {
+    const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
+    const attemptStr = retryCount !== undefined ? ` (attempt ${retryCount}/${DEFAULT_MAX_RETRIES})` : "";
+    commentOnIssue(resolvePath(workdir), story.issueNumber,
+      `❌ **Iteration failed**${attemptStr}\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
+    );
+    labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
+  }
+
+  if (codexResult.stderrInsights) {
+    hivemindStore(
+      `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
+      `ralph,session-insight,failure,${prd.projectName}`
+    );
+  }
+
+  addContextStory(workdir, {
+    id: story.id,
+    title: story.title,
+    status: "failed",
+    filesModified: codexResult.filesModified,
+    learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
+  });
+  addContextFailure(workdir, {
+    storyId: story.id,
+    storyTitle: story.title,
+    category: failureCategory,
+    error: rejectReason ? `[verification_rejected] ${rejectReason}` : validation.output.slice(0, 500),
+    toolNames: extractToolNames(codexResult.events),
+    iterationNumber,
+  });
+
+  writeRalphEvent("story_failed", {
+    jobId,
+    storyId: story.id,
+    storyTitle: story.title,
+    error: validation.output.slice(0, 500),
+    failureCategory,
+    duration: iterResult.duration,
+    workdir,
+    codexSessionId: codexResult.sessionId,
+  });
+  emitDiagnosticEvent({
+    type: "ralph:story:failed",
+    plugin: "openclaw-codex-ralph",
+    data: { jobId, storyId: story.id, storyTitle: story.title, duration: iterResult.duration, failureCategory },
+  });
+  sendOpenclawEvent(`❌ Story failed: ${story.title} [${failureCategory}]`);
+
+  return failureCategory;
+}
+
+function writeIterationLogEntry(workdir: string, opts: {
+  jobId: string;
+  iterationNumber: number;
+  story: Story;
+  codexResult: CodexIterationResult;
+  iterResult: IterationResult;
+  validation: { success: boolean; output: string };
+  promptHash: string;
+  promptFile: string;
+  promptLength: number;
+  rejectReason?: string;
+  failureCategory?: FailureCategory;
+  model: string;
+  sandbox: string;
+  startTime: number;
+}): void {
   appendIterationLog(workdir, {
     timestamp: new Date().toISOString(),
     epoch: Date.now(),
-    jobId: iterateJobId,
-    iterationNumber: (prd.metadata?.totalIterations || 1),
-    storyId: story.id,
-    storyTitle: story.title,
-    codexSessionId: codexResult.sessionId,
-    codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
-    commitHash: result.commitHash,
-    promptHash,
-    promptFile,
-    promptLength: prompt.length,
-    success: result.success,
-    validationPassed: validation.success,
-    failureCategory: iterFailCat,
-    duration: result.duration,
-    codexOutputLength: codexResult.output.length,
-    codexFinalMessageLength: codexResult.finalMessage.length,
-    toolCalls: codexResult.toolCalls,
-    toolNames: extractToolNames(codexResult.events),
-    filesModified: codexResult.filesModified,
-    validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
-    verificationPassed: result.verificationPassed,
-    verificationWarnings: result.verificationWarnings,
-    verificationRejectReason: iterateRejectReason,
-    model,
-    sandbox: cfg.sandbox,
-    startedAt: new Date(startTime).toISOString(),
+    jobId: opts.jobId,
+    iterationNumber: opts.iterationNumber,
+    storyId: opts.story.id,
+    storyTitle: opts.story.title,
+    codexSessionId: opts.codexResult.sessionId,
+    codexSessionFile: opts.codexResult.sessionId ? resolveSessionFile(opts.codexResult.sessionId) : undefined,
+    commitHash: opts.iterResult.commitHash,
+    promptHash: opts.promptHash,
+    promptFile: opts.promptFile,
+    promptLength: opts.promptLength,
+    success: opts.iterResult.success,
+    validationPassed: opts.validation.success,
+    failureCategory: opts.failureCategory,
+    duration: opts.iterResult.duration,
+    codexOutputLength: opts.codexResult.output.length,
+    codexFinalMessageLength: opts.codexResult.finalMessage.length,
+    toolCalls: opts.codexResult.toolCalls,
+    toolNames: extractToolNames(opts.codexResult.events),
+    filesModified: opts.codexResult.filesModified,
+    validationOutput: !opts.validation.success ? opts.validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
+    verificationPassed: opts.iterResult.verificationPassed,
+    verificationWarnings: opts.iterResult.verificationWarnings,
+    verificationRejectReason: opts.rejectReason,
+    model: opts.model,
+    sandbox: opts.sandbox,
+    startedAt: new Date(opts.startTime).toISOString(),
     completedAt: new Date().toISOString(),
-    stderrStats: codexResult.stderrStats,
+    stderrStats: opts.codexResult.stderrStats,
+  });
+}
+
+// ============================================================================
+// Loop Entry Points (thin wrappers around shared helpers)
+// ============================================================================
+
+async function executeRalphIterate(
+  params: { workdir: string; model?: string; dryRun?: boolean },
+  cfg: PluginConfig
+): Promise<IterationResult | { dryRun: true; story: { id: string; title: string }; promptLength: number; promptFile: string; promptHash: string; model: string; sandbox: string } | { success: true; message: string; storiesCompleted: number } | { error: string }> {
+  const workdir = params.workdir;
+  const model = params.model || cfg.model;
+  const iterateJobId = `iterate-${Date.now().toString(36)}`;
+  const iterateCfg = { ...cfg, model };
+
+  const ctx = await buildIterationContext(workdir, cfg, iterateJobId);
+  if ("error" in ctx) return { error: ctx.error };
+  if ("allDone" in ctx) return { success: true, message: "All stories complete!", storiesCompleted: ctx.prd.stories.length };
+
+  const { prd, story, prompt, promptFile, promptHash } = ctx;
+
+  if (params.dryRun) {
+    return { dryRun: true, story: { id: story.id, title: story.title }, promptLength: prompt.length, promptFile, promptHash, model, sandbox: cfg.sandbox };
+  }
+
+  const run = await runAndValidateIteration(workdir, prompt, story, iterateCfg, 2000, iterateJobId, prd);
+
+  if (run.iterResult.success) {
+    await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: iterateJobId, cfg });
+  } else {
+    const failCat = await handleIterationFailure({
+      workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, validation: run.validation,
+      rejectReason: run.rejectReason, jobId: iterateJobId, cfg, iterationNumber: prd.metadata?.totalIterations || 1,
+    });
+    run.iterResult.error = run.validation.output.slice(0, 500);
+  }
+
+  const failCat = run.iterResult.success ? undefined : (run.iterResult.verificationPassed === false ? "verification_rejected" as FailureCategory : categorizeFailure(run.validation.output));
+  writeIterationLogEntry(workdir, {
+    jobId: iterateJobId, iterationNumber: prd.metadata?.totalIterations || 1, story, codexResult: run.codexResult,
+    iterResult: run.iterResult, validation: run.validation, promptHash, promptFile, promptLength: prompt.length,
+    rejectReason: run.rejectReason, failureCategory: failCat, model, sandbox: cfg.sandbox, startTime: run.startTime,
   });
 
-  return result;
+  return run.iterResult;
 }
 
 // Legacy synchronous loop (kept for backward compatibility with ralph_iterate)
@@ -2099,44 +2176,24 @@ async function executeRalphLoopSync(
   const maxIterations = params.maxIterations || cfg.maxIterations;
   const model = params.model || cfg.model;
   const stopOnFailure = params.stopOnFailure;
-
   const loopCfg = { ...cfg, model };
   const retryTracker = new StoryRetryTracker(DEFAULT_MAX_RETRIES);
 
   const loopResult: LoopResult = {
-    success: false,
-    iterationsRun: 0,
-    storiesCompleted: 0,
-    remainingStories: 0,
-    results: [],
-    stoppedReason: "complete",
+    success: false, iterationsRun: 0, storiesCompleted: 0, remainingStories: 0, results: [], stoppedReason: "complete",
   };
 
-  let lastSyncStderrStats: MonitorStats | undefined;
-
-  // Send openclaw system event for sync loop start
-  try {
-    const startMsg = `🚀 Ralph sync loop started: max ${maxIterations} iterations`;
-    execSync(`openclaw system event --mode now --text "${startMsg.replace(/"/g, '\\"')}"`, {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: "pipe",
-    });
-  } catch { /* non-fatal */ }
+  let lastStderrStats: MonitorStats | undefined;
+  sendOpenclawEvent(`🚀 Ralph sync loop started: max ${maxIterations} iterations`);
 
   for (let i = 0; i < maxIterations; i++) {
-    const prd = readPRD(workdir);
-    if (!prd) {
-      loopResult.stoppedReason = "error";
-      break;
-    }
+    const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
+    const ctx = await buildIterationContext(workdir, cfg, syncJobId, lastStderrStats);
 
-    const story = getNextStory(prd);
-    if (!story) {
-      loopResult.success = true;
-      loopResult.stoppedReason = "complete";
-      break;
-    }
+    if ("error" in ctx) { loopResult.stoppedReason = "error"; break; }
+    if ("allDone" in ctx) { loopResult.success = true; loopResult.stoppedReason = "complete"; break; }
+
+    const { prd, story, prompt, promptFile, promptHash } = ctx;
 
     if (shouldSkipStory(story.id, workdir, DEFAULT_MAX_RETRIES)) {
       appendProgress(workdir, `Skipped: ${story.title} — exceeded ${DEFAULT_MAX_RETRIES} retries, needs human review`);
@@ -2145,362 +2202,51 @@ async function executeRalphLoopSync(
 
     loopResult.iterationsRun++;
 
-    const progress = readProgress(workdir);
-    const codebaseMap = generateCodebaseMap(workdir);
+    const run = await runAndValidateIteration(workdir, prompt, story, loopCfg, 500, syncJobId, prd);
+    lastStderrStats = run.codexResult.stderrStats;
 
-    // Pre-iteration: query hivemind for relevant prior learnings
-    const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
-    const structuredCtx = buildStructuredContextSnippet(workdir);
-    const failurePatterns = buildFailurePatternContext(workdir);
-    const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-    const prevBehavior = lastSyncStderrStats ? formatIterationBehavior(lastSyncStderrStats) : undefined;
-    let syncGhIssueCtx: string | undefined;
-    if (cfg.ghIssues && story.issueNumber) {
-      const { readIssueContext } = await import("./gh-issues.js");
-      syncGhIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
-    }
-    const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, prevBehavior || undefined, syncGhIssueCtx);
-
-    const syncJobId = `sync-${Date.now().toString(36)}-${i}`;
-    const { path: syncPromptFile, hash: syncPromptHash } = persistPrompt(syncJobId, story.id, prompt);
-
-    const startTime = Date.now();
-    const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
-    lastSyncStderrStats = codexResult.stderrStats;
-    const validation = runValidation(workdir, story.validationCommand);
-
-    const iterResult: IterationResult = {
-      success: codexResult.success && validation.success,
-      storyId: story.id,
-      storyTitle: story.title,
-      validationPassed: validation.success,
-      codexOutput: codexResult.output.slice(0, 500),
-      codexFinalMessage: codexResult.finalMessage.slice(0, 500),
-      toolCalls: codexResult.toolCalls,
-      filesModified: codexResult.filesModified,
-      duration: Date.now() - startTime,
-    };
-
-    let syncRejectReason: string | undefined;
-    if (iterResult.success) {
-      // ── Output verification ──
-      const syncVerification = verifyOutput({
-        workdir: resolvePath(workdir),
-        story,
-        codexResult,
-        validationOutput: validation.output,
-      });
-      iterResult.verificationPassed = syncVerification.passed;
-      iterResult.verificationWarnings = syncVerification.warnings.length > 0 ? syncVerification.warnings : undefined;
-
-      if (!syncVerification.passed) {
-        iterResult.success = false;
-        syncRejectReason = syncVerification.rejectReason;
-        console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${syncVerification.rejectReason}`);
-        hivemindStore(
-          `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${syncVerification.rejectReason}`,
-          `ralph,verification,rejected,${prd.projectName}`
-        );
-        writeRalphEvent("story_verification_rejected", {
-          jobId: syncJobId,
-          storyId: story.id,
-          storyTitle: story.title,
-          error: syncVerification.rejectReason || "Verification failed",
-          failureCategory: "verification_rejected",
-          duration: iterResult.duration,
-          workdir,
-          codexSessionId: codexResult.sessionId,
-          verificationRejectReason: syncVerification.rejectReason,
-        });
-        emitDiagnosticEvent({
-          type: "ralph:story:verification_rejected",
-          plugin: "openclaw-codex-ralph",
-          data: {
-            jobId: syncJobId,
-            storyId: story.id,
-            storyTitle: story.title,
-            duration: iterResult.duration,
-            rejectReason: syncVerification.rejectReason,
-          },
-        });
-        // Fall through to failure handling below
-      } else {
-        if (syncVerification.warnings.length > 0) {
-          console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${syncVerification.warnings.join("; ")}`);
-          hivemindStore(
-            `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${syncVerification.warnings.join("; ")}`,
-            `ralph,verification,warning,${prd.projectName}`
-          );
-        }
-
-        story.passes = true;
-        prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-        prd.metadata.lastIteration = new Date().toISOString();
-        prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-        writePRD(workdir, prd);
-        loopResult.storiesCompleted++;
-
-        const progressEntry = [
-          `Completed: ${story.title}`,
-          `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-          `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
-        ].join("\n");
-        appendProgress(workdir, progressEntry);
-
-        // Validate learning quality
-        const syncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-        if (!syncLearningCheck.valid) {
-          console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${syncLearningCheck.reason}`);
-          hivemindStore(
-            `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${syncLearningCheck.reason}. Agents must provide structured learnings.`,
-            `ralph,laziness,quality,${prd.projectName}`
-          );
-        }
-
-        if (cfg.autoCommit) {
-          const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
-          const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
-          iterResult.commitHash = hash || undefined;
-        }
-
-        // Enrich codebase map from session (post-commit)
-        if (codexResult.sessionId) {
-          const sessionFile = resolveSessionFile(codexResult.sessionId);
-          if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
-        }
-
-        // Close GH issue and update tracking
-        if (cfg.ghIssues && story.issueNumber) {
-          const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
-          const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
-          closeIssue(resolvePath(workdir), story.issueNumber,
-            `✅ **Completed** by Ralph loop\n\nCommit: ${iterResult.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
-          );
-          iterResult.issueNumber = story.issueNumber;
-          iterResult.issueCommented = true;
-          if (prd.metadata?.trackingIssue) {
-            updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
-          }
-        }
-
-        // Post-success: store learning in hivemind
-        if (iterResult.commitHash) {
-          hivemindStore(
-            `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-            `ralph,learning,${prd.projectName}`
-          );
-        }
-
-        // Store extracted learnings in hivemind (regardless of commit)
-        const syncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-        if (syncLearnings && syncLearnings.length >= 50) {
-          hivemindStore(
-            `Learnings from "${story.title}": ${syncLearnings}`,
-            `ralph,success,learning,${prd.projectName},${story.id}`
-          );
-        }
-
-        // Store success pattern for future iterations
-        hivemindStore(
-          `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
-          `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
-          `Duration: ${Math.round(iterResult.duration / 1000)}s. ` +
-          `Validation: ${story.validationCommand || "default"}. ` +
-          `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
-          `ralph,success-pattern,${prd.projectName}`
-        );
-
-        // Update structured context
-        addContextStory(workdir, {
-          id: story.id,
-          title: story.title,
-          status: "completed",
-          filesModified: codexResult.filesModified,
-          learnings: syncLearnings || codexResult.finalMessage.slice(0, 500),
-        });
-
-        // Store stderr insights
-        if (codexResult.stderrInsights) {
-          hivemindStore(
-            `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-            `ralph,session-insight,${prd.projectName}`
-          );
-        }
-
-        // Story complete diagnostic event
-        emitDiagnosticEvent({
-          type: "ralph:story:complete",
-          plugin: "openclaw-codex-ralph",
-          data: {
-            jobId: syncJobId,
-            storyId: story.id,
-            storyTitle: story.title,
-            duration: iterResult.duration,
-            commitHash: iterResult.commitHash,
-            filesModified: codexResult.filesModified,
-            toolCalls: codexResult.toolCalls,
-          },
-        });
-      }
+    if (run.iterResult.success) {
+      await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: syncJobId, cfg });
+      loopResult.storiesCompleted++;
     }
 
-    // Record retry after verification (which may downgrade success to failure)
-    retryTracker.recordAttempt(story.id, iterResult.success);
+    retryTracker.recordAttempt(story.id, run.iterResult.success);
 
-    if (!iterResult.success) {
-      const failureCategory: FailureCategory = iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output);
-      const failEntry = [
-        `Failed: ${story.title} [${failureCategory}]`,
-        `Validation: ${validation.output.slice(0, 300)}`,
-        `Codex: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-      ].join("\n");
-      appendProgress(workdir, failEntry);
-
-      // Store failure pattern in hivemind (with category) — skip if already stored by verification
-      if (failureCategory !== "verification_rejected") {
-        hivemindStore(
-          `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-          `ralph,failure,${failureCategory},${prd.projectName}`
-        );
-      }
-
-      // Comment failure on GH issue
-      if (cfg.ghIssues && story.issueNumber) {
-        const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
-        commentOnIssue(resolvePath(workdir), story.issueNumber,
-          `❌ **Iteration failed** (attempt ${retryTracker.getFailCount(story.id)}/${DEFAULT_MAX_RETRIES})\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
-        );
-        labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
-      }
-
-      // Store stderr insights on failure
-      if (codexResult.stderrInsights) {
-        hivemindStore(
-          `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
-          `ralph,session-insight,failure,${prd.projectName}`
-        );
-      }
-
-      // Update structured context with failure
-      addContextStory(workdir, {
-        id: story.id,
-        title: story.title,
-        status: "failed",
-        filesModified: codexResult.filesModified,
-        learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
-      });
-      addContextFailure(workdir, {
-        storyId: story.id,
-        storyTitle: story.title,
-        category: failureCategory,
-        error: syncRejectReason ? `[verification_rejected] ${syncRejectReason}` : validation.output.slice(0, 500),
-        toolNames: extractToolNames(codexResult.events),
-        iterationNumber: i + 1,
-      });
-
-      // Story failed diagnostic event
-      emitDiagnosticEvent({
-        type: "ralph:story:failed",
-        plugin: "openclaw-codex-ralph",
-        data: {
-          jobId: syncJobId,
-          storyId: story.id,
-          storyTitle: story.title,
-          duration: iterResult.duration,
-          failureCategory,
-        },
+    if (!run.iterResult.success) {
+      const failCat = await handleIterationFailure({
+        workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, validation: run.validation,
+        rejectReason: run.rejectReason, jobId: syncJobId, cfg, iterationNumber: i + 1,
+        retryCount: retryTracker.getFailCount(story.id),
       });
 
       if (stopOnFailure) {
-        // Write iteration log before breaking
-        appendIterationLog(workdir, {
-          timestamp: new Date().toISOString(),
-          epoch: Date.now(),
-          jobId: syncJobId,
-          iterationNumber: i + 1,
-          storyId: story.id,
-          storyTitle: story.title,
-          codexSessionId: codexResult.sessionId,
-          codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
-          commitHash: iterResult.commitHash,
-          promptHash: syncPromptHash,
-          promptFile: syncPromptFile,
-          promptLength: prompt.length,
-          success: false,
-          validationPassed: validation.success,
-          failureCategory,
-          duration: iterResult.duration,
-          codexOutputLength: codexResult.output.length,
-          codexFinalMessageLength: codexResult.finalMessage.length,
-          toolCalls: codexResult.toolCalls,
-          toolNames: extractToolNames(codexResult.events),
-          filesModified: codexResult.filesModified,
-          validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
-          verificationPassed: iterResult.verificationPassed,
-          verificationWarnings: iterResult.verificationWarnings,
-          verificationRejectReason: syncRejectReason,
-          model,
-          sandbox: cfg.sandbox,
-          startedAt: new Date(startTime).toISOString(),
-          completedAt: new Date().toISOString(),
-          stderrStats: codexResult.stderrStats,
+        writeIterationLogEntry(workdir, {
+          jobId: syncJobId, iterationNumber: i + 1, story, codexResult: run.codexResult,
+          iterResult: run.iterResult, validation: run.validation, promptHash, promptFile, promptLength: prompt.length,
+          rejectReason: run.rejectReason, failureCategory: failCat, model, sandbox: cfg.sandbox, startTime: run.startTime,
         });
         loopResult.stoppedReason = "failure";
-        loopResult.results.push(iterResult);
+        loopResult.results.push(run.iterResult);
         break;
       }
     }
 
-    // Write iteration log entry
-    const syncFailCat: FailureCategory | undefined = iterResult.success ? undefined : (iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output));
-    appendIterationLog(workdir, {
-      timestamp: new Date().toISOString(),
-      epoch: Date.now(),
-      jobId: syncJobId,
-      iterationNumber: i + 1,
-      storyId: story.id,
-      storyTitle: story.title,
-      codexSessionId: codexResult.sessionId,
-      codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
-      commitHash: iterResult.commitHash,
-      promptHash: syncPromptHash,
-      promptFile: syncPromptFile,
-      promptLength: prompt.length,
-      success: iterResult.success,
-      validationPassed: validation.success,
-      failureCategory: syncFailCat,
-      duration: iterResult.duration,
-      codexOutputLength: codexResult.output.length,
-      codexFinalMessageLength: codexResult.finalMessage.length,
-      toolCalls: codexResult.toolCalls,
-      toolNames: extractToolNames(codexResult.events),
-      filesModified: codexResult.filesModified,
-      validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
-      verificationPassed: iterResult.verificationPassed,
-      verificationWarnings: iterResult.verificationWarnings,
-      verificationRejectReason: syncRejectReason,
-      model,
-      sandbox: cfg.sandbox,
-      startedAt: new Date(startTime).toISOString(),
-      completedAt: new Date().toISOString(),
-      stderrStats: codexResult.stderrStats,
+    const failCat = run.iterResult.success ? undefined : (run.iterResult.verificationPassed === false ? "verification_rejected" as FailureCategory : categorizeFailure(run.validation.output));
+    writeIterationLogEntry(workdir, {
+      jobId: syncJobId, iterationNumber: i + 1, story, codexResult: run.codexResult,
+      iterResult: run.iterResult, validation: run.validation, promptHash, promptFile, promptLength: prompt.length,
+      rejectReason: run.rejectReason, failureCategory: failCat, model, sandbox: cfg.sandbox, startTime: run.startTime,
     });
 
-    loopResult.results.push(iterResult);
+    loopResult.results.push(run.iterResult);
   }
 
-  // Final status
   const finalPrd = readPRD(workdir);
   if (finalPrd) {
     loopResult.remainingStories = finalPrd.stories.filter((s) => !s.passes).length;
-    if (loopResult.remainingStories === 0) {
-      loopResult.success = true;
-    }
+    if (loopResult.remainingStories === 0) loopResult.success = true;
   }
-
-  if (loopResult.iterationsRun >= maxIterations && loopResult.remainingStories > 0) {
-    loopResult.stoppedReason = "limit";
-  }
+  if (loopResult.iterationsRun >= maxIterations && loopResult.remainingStories > 0) loopResult.stoppedReason = "limit";
 
   return loopResult;
 }
@@ -2514,69 +2260,42 @@ async function executeRalphLoopAsync(
   const workdir = job.workdir;
   const maxIterations = job.maxIterations;
   const stopOnFailure = params.stopOnFailure;
-
   const loopCfg = { ...cfg };
   const retryTracker = new StoryRetryTracker(DEFAULT_MAX_RETRIES);
 
   emitLoopProgress(job, "start");
-
-  // Clean up old event files and prompt files, emit loop_start
   cleanupOldEvents();
   cleanupOldPrompts();
   writeRalphEvent("loop_start", { jobId: job.id, totalStories: job.totalStories, workdir });
+  sendOpenclawEvent(`🚀 Ralph loop started: ${job.totalStories} stories, max ${maxIterations} iterations`);
 
-  // Send openclaw system event for loop start
-  try {
-    const startMsg = `🚀 Ralph loop started: ${job.totalStories} stories, max ${maxIterations} iterations`;
-    execSync(`openclaw system event --mode now --text "${startMsg.replace(/"/g, '\\"')}"`, {
-      encoding: "utf-8",
-      timeout: 10000,
-      stdio: "pipe",
-    });
-  } catch { /* non-fatal */ }
-
-  let lastAsyncStderrStats: MonitorStats | undefined;
+  let lastStderrStats: MonitorStats | undefined;
 
   try {
     for (let i = 0; i < maxIterations; i++) {
-      // Check for cancellation
       if (job.status === "cancelled") {
-        writeRalphEvent("loop_error", {
-          jobId: job.id,
-          error: "Loop cancelled",
-          storiesCompleted: job.storiesCompleted,
-          lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
-          workdir,
-        });
+        writeRalphEvent("loop_error", { jobId: job.id, error: "Loop cancelled", storiesCompleted: job.storiesCompleted, lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined, workdir });
         emitLoopProgress(job, "complete");
         return;
       }
 
-      const prd = readPRD(workdir);
-      if (!prd) {
-        job.status = "failed";
-        job.error = "Failed to read prd.json";
-        job.completedAt = Date.now();
+      const ctx = await buildIterationContext(workdir, cfg, job.id, lastStderrStats);
+
+      if ("error" in ctx) {
+        job.status = "failed"; job.error = ctx.error; job.completedAt = Date.now();
         emitLoopProgress(job, "error");
         return;
       }
-
-      job.totalStories = prd.stories.length;
-      const story = getNextStory(prd);
-      if (!story) {
-        job.status = "completed";
-        job.completedAt = Date.now();
-        writeRalphEvent("loop_complete", {
-          jobId: job.id,
-          storiesCompleted: job.storiesCompleted,
-          totalStories: job.totalStories,
-          duration: Date.now() - job.startedAt,
-          results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })),
-          workdir,
-        });
+      if ("allDone" in ctx) {
+        job.status = "completed"; job.completedAt = Date.now();
+        job.totalStories = ctx.prd.stories.length;
+        writeRalphEvent("loop_complete", { jobId: job.id, storiesCompleted: job.storiesCompleted, totalStories: job.totalStories, duration: Date.now() - job.startedAt, results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })), workdir });
         emitLoopProgress(job, "complete");
         return;
       }
+
+      const { prd, story, prompt, promptFile, promptHash } = ctx;
+      job.totalStories = prd.stories.length;
 
       if (shouldSkipStory(story.id, workdir, DEFAULT_MAX_RETRIES)) {
         appendProgress(workdir, `Skipped: ${story.title} — exceeded ${DEFAULT_MAX_RETRIES} retries, needs human review`);
@@ -2587,363 +2306,34 @@ async function executeRalphLoopAsync(
       job.currentStory = { id: story.id, title: story.title };
       emitLoopProgress(job, "iteration");
 
-      const progress = readProgress(workdir);
-      const codebaseMap = generateCodebaseMap(workdir);
+      const run = await runAndValidateIteration(workdir, prompt, story, loopCfg, 500, job.id, prd);
+      lastStderrStats = run.codexResult.stderrStats;
 
-      // Pre-iteration: query hivemind for relevant prior learnings
-      const hivemindCtx = aggressiveHivemindPull(story, prd, workdir);
-      const structuredCtx = buildStructuredContextSnippet(workdir);
-      const failurePatterns = buildFailurePatternContext(workdir);
-      const prevAttemptCtx = buildPreviousAttemptContext(workdir, story.id);
-      const asyncPrevBehavior = lastAsyncStderrStats ? formatIterationBehavior(lastAsyncStderrStats) : undefined;
-      let asyncGhIssueCtx: string | undefined;
-      if (cfg.ghIssues && story.issueNumber) {
-        const { readIssueContext } = await import("./gh-issues.js");
-        asyncGhIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
-      }
-      const prompt = buildIterationPrompt(prd, story, progress, hivemindCtx || undefined, structuredCtx || undefined, failurePatterns || undefined, prevAttemptCtx || undefined, codebaseMap, asyncPrevBehavior || undefined, asyncGhIssueCtx);
+      job.results.push(run.iterResult);
 
-      // Persist prompt to disk
-      const { path: asyncPromptFile, hash: asyncPromptHash } = persistPrompt(job.id, story.id, prompt);
-
-      const startTime = Date.now();
-      const codexResult = await runCodexIteration(workdir, prompt, loopCfg);
-      lastAsyncStderrStats = codexResult.stderrStats;
-      const validation = runValidation(workdir, story.validationCommand);
-
-      const iterResult: IterationResult = {
-        success: codexResult.success && validation.success,
-        storyId: story.id,
-        storyTitle: story.title,
-        validationPassed: validation.success,
-        codexOutput: codexResult.output.slice(0, 500),
-        codexFinalMessage: codexResult.finalMessage.slice(0, 500),
-        toolCalls: codexResult.toolCalls,
-        filesModified: codexResult.filesModified,
-        duration: Date.now() - startTime,
-      };
-
-      job.results.push(iterResult);
-
-      let asyncRejectReason: string | undefined;
-      if (iterResult.success) {
-        // ── Output verification ──
-        const asyncVerification = verifyOutput({
-          workdir: resolvePath(workdir),
-          story,
-          codexResult,
-          validationOutput: validation.output,
-        });
-        iterResult.verificationPassed = asyncVerification.passed;
-        iterResult.verificationWarnings = asyncVerification.warnings.length > 0 ? asyncVerification.warnings : undefined;
-
-        if (!asyncVerification.passed) {
-          iterResult.success = false;
-          asyncRejectReason = asyncVerification.rejectReason;
-          console.warn(`[openclaw-codex-ralph] ❌ Verification rejected: ${story.title} — ${asyncVerification.rejectReason}`);
-          hivemindStore(
-            `Ralph verification rejected: "${story.title}" in ${prd.projectName}. Reason: ${asyncVerification.rejectReason}`,
-            `ralph,verification,rejected,${prd.projectName}`
-          );
-          writeRalphEvent("story_verification_rejected", {
-            jobId: job.id,
-            storyId: story.id,
-            storyTitle: story.title,
-            error: asyncVerification.rejectReason || "Verification failed",
-            failureCategory: "verification_rejected",
-            duration: iterResult.duration,
-            workdir,
-            codexSessionId: codexResult.sessionId,
-            verificationRejectReason: asyncVerification.rejectReason,
-          });
-          emitDiagnosticEvent({
-            type: "ralph:story:verification_rejected",
-            plugin: "openclaw-codex-ralph",
-            data: {
-              jobId: job.id,
-              storyId: story.id,
-              storyTitle: story.title,
-              duration: iterResult.duration,
-              rejectReason: asyncVerification.rejectReason,
-            },
-          });
-          // Fall through to failure handling below
-        } else {
-          if (asyncVerification.warnings.length > 0) {
-            console.warn(`[openclaw-codex-ralph] ⚠️ Verification warnings for: ${story.title} — ${asyncVerification.warnings.join("; ")}`);
-            hivemindStore(
-              `Ralph verification warnings: "${story.title}" in ${prd.projectName}. Warnings: ${asyncVerification.warnings.join("; ")}`,
-              `ralph,verification,warning,${prd.projectName}`
-            );
-          }
-
-          story.passes = true;
-          prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
-          prd.metadata.lastIteration = new Date().toISOString();
-          prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
-          writePRD(workdir, prd);
-          job.storiesCompleted++;
-
-          const progressEntry = [
-            `Completed: ${story.title}`,
-            `Files: ${codexResult.filesModified.join(", ") || "none"}`,
-            `Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400)}`,
-          ].join("\n");
-          appendProgress(workdir, progressEntry);
-
-          // Validate learning quality
-          const asyncLearningCheck = validateLearnings(codexResult.finalMessage, codexResult.structuredResult);
-          if (!asyncLearningCheck.valid) {
-            console.warn(`[openclaw-codex-ralph] ⚠️ Low-quality learnings for: ${story.title} — ${asyncLearningCheck.reason}`);
-            hivemindStore(
-              `LAZY AGENT WARNING: Story "${story.title}" in ${prd.projectName} produced ${asyncLearningCheck.reason}. Agents must provide structured learnings.`,
-              `ralph,laziness,quality,${prd.projectName}`
-            );
-          }
-
-          if (cfg.autoCommit) {
-            const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
-            const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
-            iterResult.commitHash = hash || undefined;
-          }
-
-          // Enrich codebase map from session (post-commit)
-          if (codexResult.sessionId) {
-            const sessionFile = resolveSessionFile(codexResult.sessionId);
-            if (sessionFile) enrichMapFromSession(resolvePath(workdir), sessionFile);
-          }
-
-          // Close GH issue and update tracking
-          if (cfg.ghIssues && story.issueNumber) {
-            const { closeIssue, updateTrackingChecklist } = await import("./gh-issues.js");
-            const closeSummary = codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 400);
-            closeIssue(resolvePath(workdir), story.issueNumber,
-              `✅ **Completed** by Ralph loop\n\nCommit: ${iterResult.commitHash || "n/a"}\nFiles: ${codexResult.filesModified.join(", ")}\n\n${closeSummary}`
-            );
-            iterResult.issueNumber = story.issueNumber;
-            iterResult.issueCommented = true;
-            if (prd.metadata?.trackingIssue) {
-              updateTrackingChecklist(resolvePath(workdir), prd.metadata.trackingIssue, prd);
-            }
-          }
-
-          // Post-success: store learning in hivemind (only if committed)
-          if (iterResult.commitHash) {
-            hivemindStore(
-              `Ralph completed: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Summary: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-              `ralph,learning,${prd.projectName}`
-            );
-          }
-
-          // Store extracted learnings in hivemind (regardless of commit)
-          const asyncLearnings = extractStructuredLearnings(codexResult.finalMessage, codexResult.structuredResult);
-          if (asyncLearnings && asyncLearnings.length >= 50) {
-            hivemindStore(
-              `Learnings from "${story.title}": ${asyncLearnings}`,
-              `ralph,success,learning,${prd.projectName},${story.id}`
-            );
-          }
-
-          // Store success pattern for future iterations
-          hivemindStore(
-            `Ralph success pattern: "${story.title}" in ${prd.projectName}. ` +
-            `Tool calls: ${codexResult.toolCalls}. Files: ${codexResult.filesModified.length}. ` +
-            `Duration: ${Math.round(iterResult.duration / 1000)}s. ` +
-            `Validation: ${story.validationCommand || "default"}. ` +
-            `Key tools: ${extractToolNames(codexResult.events).join(", ")}`,
-            `ralph,success-pattern,${prd.projectName}`
-          );
-
-          // Update structured context
-          addContextStory(workdir, {
-            id: story.id,
-            title: story.title,
-            status: "completed",
-            filesModified: codexResult.filesModified,
-            learnings: asyncLearnings || codexResult.finalMessage.slice(0, 500),
-          });
-
-          // Store stderr insights
-          if (codexResult.stderrInsights) {
-            hivemindStore(
-              `Iteration behavior for "${story.title}": ${codexResult.stderrInsights}`,
-              `ralph,session-insight,${prd.projectName}`
-            );
-          }
-
-          // Story complete notification
-          writeRalphEvent("story_complete", {
-            jobId: job.id,
-            storyId: story.id,
-            storyTitle: story.title,
-            filesModified: codexResult.filesModified,
-            commitHash: iterResult.commitHash,
-            duration: iterResult.duration,
-            summary: codexResult.finalMessage.slice(0, 500),
-            workdir,
-            codexSessionId: codexResult.sessionId,
-          });
-          emitDiagnosticEvent({
-            type: "ralph:story:complete",
-            plugin: "openclaw-codex-ralph",
-            data: {
-              jobId: job.id,
-              storyId: story.id,
-              storyTitle: story.title,
-              duration: iterResult.duration,
-              commitHash: iterResult.commitHash,
-              filesModified: codexResult.filesModified,
-              toolCalls: codexResult.toolCalls,
-            },
-          });
-
-          emitLoopProgress(job, "iteration");
-
-          // Send openclaw system event for real-time monitoring
-          try {
-            const summarySnippet = (codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 200)).replace(/"/g, '\\"').replace(/\n/g, ' ');
-            const commitRef = iterResult.commitHash ? ` (${iterResult.commitHash})` : '';
-            const msg = `✅ Story complete: ${story.title}${commitRef} — ${summarySnippet}`;
-            execSync(`openclaw system event --mode now --text "${msg}"`, {
-              encoding: "utf-8",
-              timeout: 10000,
-              stdio: "pipe",
-            });
-          } catch { /* non-fatal — don't block loop on notification failure */ }
-        }
+      if (run.iterResult.success) {
+        await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: job.id, cfg });
+        job.storiesCompleted++;
+        emitLoopProgress(job, "iteration");
       }
 
-      // Record retry after verification (which may downgrade success to failure)
-      retryTracker.recordAttempt(story.id, iterResult.success);
+      retryTracker.recordAttempt(story.id, run.iterResult.success);
 
-      if (!iterResult.success) {
-        const failureCategory: FailureCategory = iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output);
-        const failEntry = [
-          `Failed: ${story.title} [${failureCategory}]`,
-          `Validation: ${validation.output.slice(0, 300)}`,
-          `Codex: ${codexResult.structuredResult?.summary || codexResult.finalMessage.slice(0, 300)}`,
-        ].join("\n");
-        appendProgress(workdir, failEntry);
-
-        // Store failure pattern in hivemind (with category) — skip if already stored by verification
-        if (failureCategory !== "verification_rejected") {
-          hivemindStore(
-            `Ralph failure [${failureCategory}]: ${story.title}. Files: ${codexResult.filesModified.join(", ")}. Error: ${validation.output.slice(0, 500)}`,
-            `ralph,failure,${failureCategory},${prd.projectName}`
-          );
-        }
-
-        // Comment failure on GH issue
-        if (cfg.ghIssues && story.issueNumber) {
-          const { commentOnIssue, labelIssue } = await import("./gh-issues.js");
-          commentOnIssue(resolvePath(workdir), story.issueNumber,
-            `❌ **Iteration failed** (attempt ${retryTracker.getFailCount(story.id)}/${DEFAULT_MAX_RETRIES})\n\nCategory: \`${failureCategory}\`\n\`\`\`\n${validation.output?.slice(0, 500) || "no output"}\n\`\`\``
-          );
-          labelIssue(resolvePath(workdir), story.issueNumber, [`ralph-${failureCategory}`]);
-        }
-
-        // Store stderr insights on failure
-        if (codexResult.stderrInsights) {
-          hivemindStore(
-            `Iteration behavior (FAILED) for "${story.title}": ${codexResult.stderrInsights}`,
-            `ralph,session-insight,failure,${prd.projectName}`
-          );
-        }
-
-        // Update structured context with failure
-        addContextStory(workdir, {
-          id: story.id,
-          title: story.title,
-          status: "failed",
-          filesModified: codexResult.filesModified,
-          learnings: `[${failureCategory}] ${validation.output.slice(0, 300)}`,
+      if (!run.iterResult.success) {
+        const failCat = await handleIterationFailure({
+          workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, validation: run.validation,
+          rejectReason: run.rejectReason, jobId: job.id, cfg, iterationNumber: i + 1,
+          retryCount: retryTracker.getFailCount(story.id),
         });
-        addContextFailure(workdir, {
-          storyId: story.id,
-          storyTitle: story.title,
-          category: failureCategory,
-          error: asyncRejectReason ? `[verification_rejected] ${asyncRejectReason}` : validation.output.slice(0, 500),
-          toolNames: extractToolNames(codexResult.events),
-          iterationNumber: i + 1,
-        });
-
-        // Story failure notification (with category)
-        writeRalphEvent("story_failed", {
-          jobId: job.id,
-          storyId: story.id,
-          storyTitle: story.title,
-          error: validation.output.slice(0, 500),
-          failureCategory: failureCategory,
-          duration: iterResult.duration,
-          workdir,
-          codexSessionId: codexResult.sessionId,
-        });
-        emitDiagnosticEvent({
-          type: "ralph:story:failed",
-          plugin: "openclaw-codex-ralph",
-          data: {
-            jobId: job.id,
-            storyId: story.id,
-            storyTitle: story.title,
-            duration: iterResult.duration,
-            failureCategory,
-          },
-        });
-
-        // Send openclaw system event for failure
-        try {
-          const msg = `❌ Story failed: ${story.title} [${failureCategory}]`;
-          execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
-            encoding: "utf-8",
-            timeout: 10000,
-            stdio: "pipe",
-          });
-        } catch { /* non-fatal */ }
 
         if (stopOnFailure) {
-          // Write iteration log before returning
-          appendIterationLog(workdir, {
-            timestamp: new Date().toISOString(),
-            epoch: Date.now(),
-            jobId: job.id,
-            iterationNumber: i + 1,
-            storyId: story.id,
-            storyTitle: story.title,
-            codexSessionId: codexResult.sessionId,
-            codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
-            commitHash: iterResult.commitHash,
-            promptHash: asyncPromptHash,
-            promptFile: asyncPromptFile,
-            promptLength: prompt.length,
-            success: false,
-            validationPassed: validation.success,
-            failureCategory,
-            duration: iterResult.duration,
-            codexOutputLength: codexResult.output.length,
-            codexFinalMessageLength: codexResult.finalMessage.length,
-            toolCalls: codexResult.toolCalls,
-            toolNames: extractToolNames(codexResult.events),
-            filesModified: codexResult.filesModified,
-            validationOutput: validation.output.slice(0, VALIDATION_OUTPUT_LIMIT),
-            verificationPassed: iterResult.verificationPassed,
-            verificationWarnings: iterResult.verificationWarnings,
-            verificationRejectReason: asyncRejectReason,
-            model: loopCfg.model,
-            sandbox: cfg.sandbox,
-            startedAt: new Date(startTime).toISOString(),
-            completedAt: new Date().toISOString(),
-            stderrStats: codexResult.stderrStats,
+          writeIterationLogEntry(workdir, {
+            jobId: job.id, iterationNumber: i + 1, story, codexResult: run.codexResult,
+            iterResult: run.iterResult, validation: run.validation, promptHash, promptFile, promptLength: prompt.length,
+            rejectReason: run.rejectReason, failureCategory: failCat, model: loopCfg.model, sandbox: cfg.sandbox, startTime: run.startTime,
           });
-          job.status = "failed";
-          job.error = `Story failed: ${story.title}`;
-          job.completedAt = Date.now();
-          writeRalphEvent("loop_error", {
-            jobId: job.id,
-            error: job.error,
-            storiesCompleted: job.storiesCompleted,
-            lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
-            workdir,
-          });
+          job.status = "failed"; job.error = `Story failed: ${story.title}`; job.completedAt = Date.now();
+          writeRalphEvent("loop_error", { jobId: job.id, error: job.error, storiesCompleted: job.storiesCompleted, lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined, workdir });
           emitLoopProgress(job, "error");
           return;
         }
@@ -2951,93 +2341,34 @@ async function executeRalphLoopAsync(
         emitLoopProgress(job, "iteration");
       }
 
-      // Write iteration log entry
-      const asyncFailCat: FailureCategory | undefined = iterResult.success ? undefined : (iterResult.verificationPassed === false ? "verification_rejected" : categorizeFailure(validation.output));
-      appendIterationLog(workdir, {
-        timestamp: new Date().toISOString(),
-        epoch: Date.now(),
-        jobId: job.id,
-        iterationNumber: i + 1,
-        storyId: story.id,
-        storyTitle: story.title,
-        codexSessionId: codexResult.sessionId,
-        codexSessionFile: codexResult.sessionId ? resolveSessionFile(codexResult.sessionId) : undefined,
-        commitHash: iterResult.commitHash,
-        promptHash: asyncPromptHash,
-        promptFile: asyncPromptFile,
-        promptLength: prompt.length,
-        success: iterResult.success,
-        validationPassed: validation.success,
-        failureCategory: asyncFailCat,
-        duration: iterResult.duration,
-        codexOutputLength: codexResult.output.length,
-        codexFinalMessageLength: codexResult.finalMessage.length,
-        toolCalls: codexResult.toolCalls,
-        toolNames: extractToolNames(codexResult.events),
-        filesModified: codexResult.filesModified,
-        validationOutput: !validation.success ? validation.output.slice(0, VALIDATION_OUTPUT_LIMIT) : undefined,
-        verificationPassed: iterResult.verificationPassed,
-        verificationWarnings: iterResult.verificationWarnings,
-        verificationRejectReason: asyncRejectReason,
-        model: loopCfg.model,
-        sandbox: cfg.sandbox,
-        startedAt: new Date(startTime).toISOString(),
-        completedAt: new Date().toISOString(),
-        stderrStats: codexResult.stderrStats,
+      const failCat = run.iterResult.success ? undefined : (run.iterResult.verificationPassed === false ? "verification_rejected" as FailureCategory : categorizeFailure(run.validation.output));
+      writeIterationLogEntry(workdir, {
+        jobId: job.id, iterationNumber: i + 1, story, codexResult: run.codexResult,
+        iterResult: run.iterResult, validation: run.validation, promptHash, promptFile, promptLength: prompt.length,
+        rejectReason: run.rejectReason, failureCategory: failCat, model: loopCfg.model, sandbox: cfg.sandbox, startTime: run.startTime,
       });
     }
 
     // Reached max iterations
     const finalPrd = readPRD(workdir);
     const remaining = finalPrd ? finalPrd.stories.filter((s) => !s.passes).length : 0;
-    
-    if (remaining === 0) {
-      job.status = "completed";
-    } else {
-      job.status = "completed";
-      job.error = `Max iterations reached with ${remaining} stories remaining`;
-    }
+    job.status = "completed";
+    if (remaining > 0) job.error = `Max iterations reached with ${remaining} stories remaining`;
     job.completedAt = Date.now();
 
-    // Loop complete notification
-    writeRalphEvent("loop_complete", {
-      jobId: job.id,
-      storiesCompleted: job.storiesCompleted,
-      totalStories: job.totalStories,
-      duration: Date.now() - job.startedAt,
-      results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })),
-      workdir,
-    });
-
+    writeRalphEvent("loop_complete", { jobId: job.id, storiesCompleted: job.storiesCompleted, totalStories: job.totalStories, duration: Date.now() - job.startedAt, results: job.results.map((r) => ({ storyTitle: r.storyTitle, success: r.success, duration: r.duration })), workdir });
     emitLoopProgress(job, "complete");
 
-    // Send openclaw system event for loop completion
-    try {
-      const passed = job.results.filter(r => r.success).length;
-      const failed = job.results.filter(r => !r.success).length;
-      const elapsed = Math.round((Date.now() - job.startedAt) / 1000);
-      const msg = `🏁 Ralph loop complete: ${passed} passed, ${failed} failed, ${elapsed}s elapsed. ${remaining === 0 ? 'All stories done!' : `${remaining} stories remaining.`}`;
-      execSync(`openclaw system event --mode now --text "${msg.replace(/"/g, '\\"')}"`, {
-        encoding: "utf-8",
-        timeout: 10000,
-        stdio: "pipe",
-      });
-    } catch { /* non-fatal */ }
+    const passed = job.results.filter(r => r.success).length;
+    const failed = job.results.filter(r => !r.success).length;
+    const elapsed = Math.round((Date.now() - job.startedAt) / 1000);
+    sendOpenclawEvent(`🏁 Ralph loop complete: ${passed} passed, ${failed} failed, ${elapsed}s elapsed. ${remaining === 0 ? 'All stories done!' : `${remaining} stories remaining.`}`);
 
   } catch (err) {
     job.status = "failed";
     job.error = err instanceof Error ? err.message : String(err);
     job.completedAt = Date.now();
-
-    // Loop error notification
-    writeRalphEvent("loop_error", {
-      jobId: job.id,
-      error: job.error,
-      storiesCompleted: job.storiesCompleted,
-      lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined,
-      workdir,
-    });
-
+    writeRalphEvent("loop_error", { jobId: job.id, error: job.error, storiesCompleted: job.storiesCompleted, lastStory: job.currentStory ? { id: job.currentStory.id, title: job.currentStory.title } : undefined, workdir });
     emitLoopProgress(job, "error");
   }
 }
