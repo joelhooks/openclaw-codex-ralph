@@ -2,3 +2,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 .DS_Store
+
+# Swarm worker tracking
+.claude/.worker-tracking/
+.hive/

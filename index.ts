@@ -3095,6 +3095,7 @@ const ralphCodexPlugin = {
       sandbox: { type: "string", default: "danger-full-access" },
       autoCommit: { type: "boolean", default: true },
       debug: { type: "boolean", default: false },
+      ghIssues: { type: "boolean", default: false },
     },
     additionalProperties: false,
   },
