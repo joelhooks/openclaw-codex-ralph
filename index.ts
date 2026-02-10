@@ -52,6 +52,7 @@ interface Story {
   validationCommand?: string;
   acceptanceCriteria?: string[];
   issueNumber?: number;
+  demoInstructions?: string;
 }
 
 interface PRD {
@@ -456,7 +457,7 @@ function getLastCursor(): CursorEntry | null {
 // Failure Categorization
 // ============================================================================
 
-type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "verification_rejected" | "unknown";
+type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "verification_rejected" | "demo_verification_failed" | "unknown";
 
 function categorizeFailure(output: string): FailureCategory {
   const lower = output.toLowerCase();
@@ -790,6 +791,11 @@ interface SessionInfo {
 // Config
 // ============================================================================
 
+interface ShowboatConfig {
+  enabled: boolean;
+  alwaysRequire: boolean;
+}
+
 interface PluginConfig {
   model: string;
   maxIterations: number;
@@ -797,6 +803,7 @@ interface PluginConfig {
   autoCommit: boolean;
   debug: boolean;
   ghIssues: boolean;
+  showboat: ShowboatConfig;
 }
 
 const DEFAULT_CONFIG: PluginConfig = {
@@ -806,6 +813,7 @@ const DEFAULT_CONFIG: PluginConfig = {
   autoCommit: true,
   debug: false,
   ghIssues: false,
+  showboat: { enabled: false, alwaysRequire: false },
 };
 
 // ============================================================================
@@ -1609,6 +1617,7 @@ async function executeRalphAddStory(params: {
   priority?: number;
   validationCommand?: string;
   acceptanceCriteria?: string;
+  demoInstructions?: string;
 }, cfg: PluginConfig) {
   const prd = readPRD(params.workdir);
   if (!prd) {
@@ -1631,6 +1640,10 @@ async function executeRalphAddStory(params: {
     } catch {
       story.acceptanceCriteria = [params.acceptanceCriteria];
     }
+  }
+
+  if (params.demoInstructions) {
+    story.demoInstructions = params.demoInstructions;
   }
 
   // Create GH issue for the story if ghIssues enabled
@@ -1689,6 +1702,7 @@ async function executeRalphEditStory(params: {
   priority?: number;
   passes?: boolean;
   validationCommand?: string;
+  demoInstructions?: string;
 }) {
   const prd = readPRD(params.workdir);
   if (!prd) {
@@ -1705,6 +1719,7 @@ async function executeRalphEditStory(params: {
   if (params.priority !== undefined) story.priority = params.priority;
   if (params.passes !== undefined) story.passes = params.passes;
   if (params.validationCommand !== undefined) story.validationCommand = params.validationCommand;
+  if (params.demoInstructions !== undefined) story.demoInstructions = params.demoInstructions;
 
   writePRD(params.workdir, prd);
 
@@ -1777,12 +1792,111 @@ async function buildIterationContext(
   return { prd, story, prompt, promptFile, promptHash, jobId };
 }
 
+// ============================================================================
+// Showboat Demo Phase
+// ============================================================================
+
+interface DemoResult {
+  required: boolean;
+  passed: boolean;
+  demoFile?: string;
+  verifyOutput?: string;
+  error?: string;
+}
+
+function shouldRunDemo(story: Story, cfg: PluginConfig): boolean {
+  if (!cfg.showboat.enabled) return false;
+  if (cfg.showboat.alwaysRequire) return true;
+  return !!story.demoInstructions;
+}
+
+function buildDemoPrompt(story: Story, demoFile: string): string {
+  const instructions = story.demoInstructions || `Demonstrate that "${story.title}" works correctly.`;
+  return [
+    "CONTEXT: DEMO PHASE",
+    "ROLE: You are creating a Showboat proof-of-work document demonstrating a feature works.",
+    "",
+    "RULES:",
+    "- DO NOT edit any source files. Only use showboat commands and read files.",
+    "- DO NOT create or modify any files other than through showboat CLI.",
+    "- Use ONLY: uvx showboat init, uvx showboat exec, uvx showboat note, uvx showboat image",
+    "- Read source files to understand what was built, then demonstrate it via showboat.",
+    "",
+    `TASK: Create a demo document at ${demoFile}`,
+    "",
+    "STEPS:",
+    `1. Run: uvx showboat init ${demoFile} "${story.title} Demo"`,
+    `2. Use: uvx showboat note ${demoFile} "<commentary about what you're demonstrating>"`,
+    `3. Use: uvx showboat exec ${demoFile} bash "<command to run>" to capture proof`,
+    "4. Repeat note/exec as needed to build a complete demonstration",
+    "",
+    `DEMO INSTRUCTIONS: ${instructions}`,
+    "",
+    `The demo must prove that "${story.title}" works. Show real command output, not fabricated results.`,
+  ].join("\n");
+}
+
+async function runShowboatDemo(
+  workdir: string,
+  story: Story,
+  cfg: PluginConfig,
+): Promise<DemoResult> {
+  if (!shouldRunDemo(story, cfg)) {
+    return { required: false, passed: true };
+  }
+
+  const resolvedWorkdir = resolvePath(workdir);
+  const demosDir = join(resolvedWorkdir, "demos");
+  mkdirSync(demosDir, { recursive: true });
+
+  const demoFile = `demos/${story.id}.md`;
+  const demoPrompt = buildDemoPrompt(story, demoFile);
+
+  console.log(`[openclaw-codex-ralph] 🎭 Starting showboat demo phase for: ${story.title}`);
+
+  // Spawn a read-only Codex session for the demo
+  const demoResult = await runCodexIteration(workdir, demoPrompt, {
+    ...cfg,
+    sandbox: "read-only",
+  });
+
+  if (!demoResult.success) {
+    return {
+      required: true,
+      passed: false,
+      demoFile,
+      error: `Demo Codex session failed: ${demoResult.output.slice(0, 500)}`,
+    };
+  }
+
+  // Verify the demo document — run by Ralph, not the agent
+  const fullDemoPath = join(resolvedWorkdir, demoFile);
+  try {
+    const verifyResult = execSync(`uvx showboat verify ${fullDemoPath}`, {
+      cwd: resolvedWorkdir,
+      encoding: "utf-8",
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PATH: `${process.env.HOME}/.local/bin:${process.env.PATH}`,
+      },
+    });
+    console.log(`[openclaw-codex-ralph] ✅ Showboat verify passed for: ${story.title}`);
+    return { required: true, passed: true, demoFile, verifyOutput: verifyResult };
+  } catch (err: any) {
+    const output = err.stdout || err.stderr || err.message || "Unknown verify error";
+    console.warn(`[openclaw-codex-ralph] ❌ Showboat verify failed for: ${story.title}\n${output}`);
+    return { required: true, passed: false, demoFile, verifyOutput: output, error: "Showboat verify failed" };
+  }
+}
+
 interface RunResult {
   iterResult: IterationResult;
   codexResult: CodexIterationResult;
   validation: { success: boolean; output: string };
   rejectReason?: string;
   startTime: number;
+  demoResult?: DemoResult;
 }
 
 async function runAndValidateIteration(
@@ -1854,7 +1968,43 @@ async function runAndValidateIteration(
     }
   }
 
-  return { iterResult, codexResult, validation, rejectReason, startTime };
+  // Showboat demo phase — runs after verification passes, before returning success
+  let demoResult: DemoResult | undefined;
+  if (iterResult.success && shouldRunDemo(story, cfg)) {
+    demoResult = await runShowboatDemo(workdir, story, cfg);
+    if (!demoResult.passed) {
+      iterResult.success = false;
+      rejectReason = demoResult.error || "Demo verification failed";
+      console.warn(`[openclaw-codex-ralph] ❌ Demo phase failed: ${story.title} — ${rejectReason}`);
+      writeRalphEvent("story_demo_failed", {
+        jobId,
+        storyId: story.id,
+        storyTitle: story.title,
+        error: rejectReason,
+        failureCategory: "demo_verification_failed",
+        duration: iterResult.duration,
+        workdir,
+        codexSessionId: codexResult.sessionId,
+      });
+      emitDiagnosticEvent({
+        type: "ralph:story:demo_failed",
+        plugin: "openclaw-codex-ralph",
+        data: { jobId, storyId: story.id, storyTitle: story.title, duration: iterResult.duration, demoFile: demoResult.demoFile, error: rejectReason },
+      });
+      hivemindStore(
+        `Ralph demo failed: "${story.title}" in ${prd.projectName}. Error: ${rejectReason}. Verify output: ${(demoResult.verifyOutput || "").slice(0, 300)}`,
+        `ralph,demo,failed,${prd.projectName}`
+      );
+    } else {
+      console.log(`[openclaw-codex-ralph] ✅ Demo phase passed: ${story.title} → ${demoResult.demoFile}`);
+      hivemindStore(
+        `Ralph demo passed: "${story.title}" in ${prd.projectName}. Demo: ${demoResult.demoFile}`,
+        `ralph,demo,success,${prd.projectName}`
+      );
+    }
+  }
+
+  return { iterResult, codexResult, validation, rejectReason, startTime, demoResult };
 }
 
 interface SuccessContext {
@@ -1865,6 +2015,7 @@ interface SuccessContext {
   codexResult: CodexIterationResult;
   jobId: string;
   cfg: PluginConfig;
+  demoResult?: DemoResult;
 }
 
 async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
@@ -1896,8 +2047,17 @@ async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
   }
 
   if (cfg.autoCommit) {
+    // If demo was required and passed, ensure demo file is staged
+    const { demoResult } = ctx;
+    if (demoResult?.required && demoResult.passed && demoResult.demoFile) {
+      try {
+        execSync(`git add ${demoResult.demoFile}`, { cwd: resolvePath(workdir), encoding: "utf-8" });
+      } catch { /* git add -A in gitCommit will catch it anyway */ }
+    }
+
     const issueRef = story.issueNumber ? ` (#${story.issueNumber})` : "";
-    const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}`);
+    const demoRef = demoResult?.required && demoResult.passed && demoResult.demoFile ? `\n\nDemo: ${demoResult.demoFile}` : "";
+    const hash = gitCommit(workdir, `ralph: ${story.title}${issueRef}${demoRef}`);
     iterResult.commitHash = hash || undefined;
   }
 
@@ -2148,7 +2308,7 @@ async function executeRalphIterate(
   const run = await runAndValidateIteration(workdir, prompt, story, iterateCfg, 2000, iterateJobId, prd);
 
   if (run.iterResult.success) {
-    await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: iterateJobId, cfg });
+    await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: iterateJobId, cfg, demoResult: run.demoResult });
   } else {
     const failCat = await handleIterationFailure({
       workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, validation: run.validation,
@@ -2206,7 +2366,7 @@ async function executeRalphLoopSync(
     lastStderrStats = run.codexResult.stderrStats;
 
     if (run.iterResult.success) {
-      await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: syncJobId, cfg });
+      await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: syncJobId, cfg, demoResult: run.demoResult });
       loopResult.storiesCompleted++;
     }
 
@@ -2312,7 +2472,7 @@ async function executeRalphLoopAsync(
       job.results.push(run.iterResult);
 
       if (run.iterResult.success) {
-        await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: job.id, cfg });
+        await handleIterationSuccess({ workdir, prd, story, iterResult: run.iterResult, codexResult: run.codexResult, jobId: job.id, cfg, demoResult: run.demoResult });
         job.storiesCompleted++;
         emitLoopProgress(job, "iteration");
       }
@@ -2432,9 +2592,11 @@ const ralphCodexPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    const rawCfg = api.pluginConfig as Partial<PluginConfig> & { showboat?: Partial<ShowboatConfig> };
     const cfg: PluginConfig = {
       ...DEFAULT_CONFIG,
-      ...(api.pluginConfig as Partial<PluginConfig>),
+      ...rawCfg,
+      showboat: { ...DEFAULT_CONFIG.showboat, ...(rawCfg.showboat || {}) },
     };
 
     // ralph_init
@@ -2472,6 +2634,7 @@ const ralphCodexPlugin = {
           priority: { type: "number", description: "Priority (1 = highest, default: 10)" },
           validationCommand: { type: "string", description: "Command to validate the story (e.g., 'npm test')" },
           acceptanceCriteria: { type: "string", description: "Acceptance criteria as JSON array of strings" },
+          demoInstructions: { type: "string", description: "Instructions for showboat demo phase (triggers demo when showboat is enabled)" },
         },
         required: ["workdir", "title", "description"],
         additionalProperties: false,
@@ -2516,6 +2679,7 @@ const ralphCodexPlugin = {
           priority: { type: "number", description: "New priority" },
           passes: { type: "boolean", description: "Mark as passed/failed" },
           validationCommand: { type: "string", description: "New validation command" },
+          demoInstructions: { type: "string", description: "Instructions for showboat demo phase" },
         },
         required: ["workdir", "storyId"],
         additionalProperties: false,
