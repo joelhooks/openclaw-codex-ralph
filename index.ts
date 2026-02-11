@@ -466,7 +466,7 @@ function getLastCursor(): CursorEntry | null {
 // Failure Categorization
 // ============================================================================
 
-type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "verification_rejected" | "demo_verification_failed" | "unknown";
+type FailureCategory = "type_error" | "test_failure" | "lint_error" | "build_error" | "timeout" | "verification_rejected" | "demo_verification_failed" | "analysis_paralysis" | "unknown";
 
 function categorizeFailure(output: string): FailureCategory {
   const lower = output.toLowerCase();
@@ -1137,7 +1137,142 @@ function buildPreviousAttemptContext(workdir: string, storyId: string): string {
   return result.length > 3000 ? result.slice(0, 3000) + "\n..." : result;
 }
 
-function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string, previousBehavior?: string, issueContext?: string): string {
+// ============================================================================
+// Research File Persistence (anti-analysis-paralysis)
+// ============================================================================
+
+const RESEARCH_DIR = ".ralph/research";
+
+function getResearchFilePath(workdir: string, storyId: string): string {
+  return join(resolvePath(workdir), RESEARCH_DIR, `${storyId}.md`);
+}
+
+/**
+ * Detect analysis paralysis: many tool calls, zero files written.
+ */
+function isAnalysisParalysis(toolCalls: number, filesModified: string[]): boolean {
+  return filesModified.length === 0 && toolCalls > 40;
+}
+
+/**
+ * Parse a Codex session's events to extract what files were read and key commands run.
+ * Returns a structured research summary suitable for injecting into the next prompt.
+ */
+function buildResearchSummary(events: CodexEvent[], story: Story): string {
+  const filesRead = new Map<string, number>(); // path → count of reads
+  const commandsRun: string[] = [];
+  const reasoningNotes: string[] = [];
+
+  for (const event of events) {
+    if (!event.item) continue;
+
+    if ((event.type === "item.completed" || event.type === "item.started") && event.item.type === "command_execution" && event.item.command) {
+      const cmd = event.item.command;
+      const shellMatch = cmd.match(/-lc\s+"(?:cd\s+[^&]+&&\s*)?(.+?)"/);
+      const displayCmd = shellMatch ? shellMatch[1]! : cmd;
+
+      // Track file reads (cat, head, tail, less, rg, grep, find, ls)
+      const readMatch = displayCmd.match(/(?:cat|head|tail|less|bat)\s+(.+?)(?:\s|$)/);
+      if (readMatch && readMatch[1]) {
+        const file = readMatch[1].replace(/['"]/g, "").trim();
+        filesRead.set(file, (filesRead.get(file) || 0) + 1);
+      }
+
+      // Track grep/rg patterns as exploration
+      const grepMatch = displayCmd.match(/(?:rg|grep)\s+(?:-[^\s]+\s+)*["']?(.+?)["']?\s/);
+      if (grepMatch) {
+        commandsRun.push(displayCmd.slice(0, 120));
+      }
+
+      // Track other meaningful commands
+      if (!readMatch && !grepMatch && displayCmd.length > 5) {
+        commandsRun.push(displayCmd.slice(0, 120));
+      }
+    }
+
+    // Capture reasoning notes
+    if (event.type === "item.completed" && event.item.type === "reasoning" && event.item.text) {
+      const note = event.item.text.split("\n")[0]?.slice(0, 200);
+      if (note && note.length > 20) {
+        reasoningNotes.push(note);
+      }
+    }
+  }
+
+  const parts: string[] = [];
+  parts.push(`# Research Notes: ${story.title}`);
+  parts.push(`\nGenerated from a previous attempt that spent all its time reading without writing.`);
+  parts.push(`Use these notes to skip the exploration phase and start implementing immediately.\n`);
+
+  if (filesRead.size > 0) {
+    parts.push(`## Key Files Examined`);
+    const sorted = [...filesRead.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [file, count] of sorted.slice(0, 30)) {
+      parts.push(`- \`${file}\`${count > 1 ? ` (read ${count}x)` : ""}`);
+    }
+  }
+
+  if (commandsRun.length > 0) {
+    parts.push(`\n## Search Commands Used`);
+    for (const cmd of commandsRun.slice(0, 20)) {
+      parts.push(`- \`${cmd}\``);
+    }
+  }
+
+  if (reasoningNotes.length > 0) {
+    parts.push(`\n## Agent Reasoning Notes`);
+    for (const note of reasoningNotes.slice(0, 10)) {
+      parts.push(`- ${note}`);
+    }
+  }
+
+  return parts.join("\n");
+}
+
+/**
+ * Write a research file for a story after an analysis paralysis failure.
+ */
+function writeResearchFile(workdir: string, storyId: string, events: CodexEvent[], story: Story): void {
+  try {
+    const researchDir = join(resolvePath(workdir), RESEARCH_DIR);
+    mkdirSync(researchDir, { recursive: true });
+    const summary = buildResearchSummary(events, story);
+    writeFileSync(getResearchFilePath(workdir, storyId), summary);
+    console.log(`[openclaw-codex-ralph] 📝 Research file saved for story ${storyId} (analysis paralysis mitigation)`);
+  } catch (err) {
+    console.error(`[openclaw-codex-ralph] Failed to write research file: ${err}`);
+  }
+}
+
+/**
+ * Read a research file if it exists for a story.
+ */
+function readResearchFile(workdir: string, storyId: string): string | null {
+  const filePath = getResearchFilePath(workdir, storyId);
+  if (!existsSync(filePath)) return null;
+  try {
+    return readFileSync(filePath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Clean up the research file after a story succeeds.
+ */
+function cleanupResearchFile(workdir: string, storyId: string): void {
+  const filePath = getResearchFilePath(workdir, storyId);
+  try {
+    if (existsSync(filePath)) {
+      unlinkSync(filePath);
+      console.log(`[openclaw-codex-ralph] 🧹 Cleaned up research file for story ${storyId}`);
+    }
+  } catch {
+    // non-fatal
+  }
+}
+
+function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemindContext?: string, structuredContext?: string, failurePatternContext?: string, previousAttemptContext?: string, codebaseMap?: string, previousBehavior?: string, issueContext?: string, researchContext?: string): string {
   const parts: string[] = [];
 
   parts.push(`# Project: ${prd.projectName}`);
@@ -1221,6 +1356,16 @@ ${previousAttemptContext}`);
 
   if (issueContext) {
     parts.push(`\n## GitHub Issue #${story.issueNumber || "?"}\n${issueContext.slice(0, 1500)}`);
+  }
+
+  if (researchContext) {
+    parts.push(`\n## ⚡ PREVIOUS ATTEMPT RESEARCH (CRITICAL — READ THIS)
+
+IMPORTANT: A previous attempt spent all its time reading files without writing any code (analysis paralysis).
+The research from that attempt is saved below. Do NOT re-read these files. You already know what's in them.
+Start writing code within your first 10 tool calls. Plan briefly (2-3 tool calls max), then execute.
+
+${researchContext}`);
   }
 
   parts.push(`\n## RULES (non-negotiable)
@@ -1836,11 +1981,14 @@ async function buildIterationContext(
     ghIssueCtx = readIssueContext(resolvePath(workdir), story.issueNumber) || undefined;
   }
 
+  // Read research file if it exists (from previous analysis paralysis failure)
+  const researchCtx = readResearchFile(workdir, story.id) || undefined;
+
   const prompt = buildIterationPrompt(
     prd, story, progress,
     hivemindContext || undefined, structuredCtx || undefined,
     failurePatterns || undefined, prevAttemptCtx || undefined,
-    codebaseMap, prevBehavior || undefined, ghIssueCtx
+    codebaseMap, prevBehavior || undefined, ghIssueCtx, researchCtx
   );
 
   const { path: promptFile, hash: promptHash } = persistPrompt(jobId, story.id, prompt);
@@ -2087,6 +2235,7 @@ async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
   const { workdir, prd, story, iterResult, codexResult, jobId, cfg } = ctx;
 
   story.passes = true;
+  cleanupResearchFile(workdir, story.id);
   prd.metadata = prd.metadata || { createdAt: new Date().toISOString() };
   prd.metadata.lastIteration = new Date().toISOString();
   prd.metadata.totalIterations = (prd.metadata.totalIterations || 0) + 1;
@@ -2227,9 +2376,20 @@ interface FailureContext {
 async function handleIterationFailure(ctx: FailureContext): Promise<FailureCategory> {
   const { workdir, prd, story, iterResult, codexResult, validation, rejectReason, jobId, cfg, iterationNumber, retryCount } = ctx;
 
+  // Detect analysis paralysis: many tool calls, zero files written
+  const analysisParalysis = isAnalysisParalysis(codexResult.toolCalls, codexResult.filesModified);
+
   const failureCategory: FailureCategory = iterResult.verificationPassed === false
     ? "verification_rejected"
+    : analysisParalysis
+    ? "analysis_paralysis"
     : categorizeFailure(validation.output);
+
+  if (analysisParalysis) {
+    console.warn(`[openclaw-codex-ralph] ⚠️ Analysis paralysis detected: Codex spent ${codexResult.toolCalls} tool calls without writing any files`);
+    // Write research file from the session so the next attempt can skip exploration
+    writeResearchFile(workdir, story.id, codexResult.events, story);
+  }
 
   const failEntry = [
     `Failed: ${story.title} [${failureCategory}]`,
