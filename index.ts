@@ -655,9 +655,9 @@ function readStoryContext(workdir: string): string {
       for (const file of files) {
         try {
           const event = JSON.parse(readFileSync(join(RALPH_EVENTS_DIR, file), "utf-8")) as RalphEvent;
-          if (event.type === "story_complete") {
+          if (event.type === "story_committed" || event.type === "story_complete") {
             eventSummaries.push(`✅ ${event.storyTitle}: ${event.summary?.slice(0, 150) || "completed"}`);
-          } else if (event.type === "story_failed") {
+          } else if (event.type === "story_rejected" || event.type === "story_failed") {
             const cat = event.failureCategory ? ` [${event.failureCategory}]` : "";
             eventSummaries.push(`❌ ${event.storyTitle}${cat}: ${event.error?.slice(0, 150) || "failed"}`);
           }
@@ -1966,6 +1966,15 @@ async function runAndValidateIteration(
 ): Promise<RunResult> {
   const startTime = Date.now();
   const codexResult = await runCodexIteration(workdir, prompt, cfg);
+
+  // Neutral event: Codex session ended, verification not yet run
+  sendOpenclawEvent(`Ralph: Codex finished ${story.title}, verifying...`);
+  emitDiagnosticEvent({
+    type: "ralph:story:codex_done",
+    plugin: "openclaw-codex-ralph",
+    data: { jobId, storyId: story.id, storyTitle: story.title, codexSuccess: codexResult.success, filesModified: codexResult.filesModified },
+  });
+
   const validation = runValidation(workdir, story.validationCommand);
 
   const iterResult: IterationResult = {
@@ -2174,7 +2183,7 @@ async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
     );
   }
 
-  writeRalphEvent("story_complete", {
+  writeRalphEvent("story_committed", {
     jobId,
     storyId: story.id,
     storyTitle: story.title,
@@ -2186,7 +2195,7 @@ async function handleIterationSuccess(ctx: SuccessContext): Promise<void> {
     codexSessionId: codexResult.sessionId,
   });
   emitDiagnosticEvent({
-    type: "ralph:story:complete",
+    type: "ralph:story:committed",
     plugin: "openclaw-codex-ralph",
     data: {
       jobId,
@@ -2268,7 +2277,7 @@ async function handleIterationFailure(ctx: FailureContext): Promise<FailureCateg
     iterationNumber,
   });
 
-  writeRalphEvent("story_failed", {
+  writeRalphEvent("story_rejected", {
     jobId,
     storyId: story.id,
     storyTitle: story.title,
@@ -2279,7 +2288,7 @@ async function handleIterationFailure(ctx: FailureContext): Promise<FailureCateg
     codexSessionId: codexResult.sessionId,
   });
   emitDiagnosticEvent({
-    type: "ralph:story:failed",
+    type: "ralph:story:rejected",
     plugin: "openclaw-codex-ralph",
     data: { jobId, storyId: story.id, storyTitle: story.title, duration: iterResult.duration, failureCategory },
   });
