@@ -40,6 +40,9 @@ export interface VerificationInput {
     title: string;
     description: string;
     acceptanceCriteria?: string[];
+    targetFiles?: string[];
+    noTestWrites?: boolean;
+    acceptanceAssertions?: string[];
   };
   codexResult: {
     toolCalls: number;
@@ -343,6 +346,99 @@ export function checkHeavyExplorationNoWrites(
   return null;
 }
 
+// ─── Target File Verification ───────────────────────────────────────────────
+
+/**
+ * REJECT if story.targetFiles specified but none appear in the diff.
+ * Catches the "passed by doing nothing to the actual code" failure mode.
+ * Partial path matching: "rpg-engine.ts" matches "apps/network/src/games/rpg-engine.ts".
+ */
+export function checkTargetFiles(
+  diffStats: DiffStats,
+  targetFiles?: string[]
+): VerificationCheck | null {
+  if (!targetFiles || targetFiles.length === 0) return null;
+
+  const changedFiles = diffStats.files;
+  const missing: string[] = [];
+
+  for (const target of targetFiles) {
+    const found = changedFiles.some(
+      (f) => f.includes(target) || target.includes(f)
+    );
+    if (!found) missing.push(target);
+  }
+
+  if (missing.length > 0) {
+    return {
+      name: "target_files_missing",
+      severity: "REJECT",
+      message: `Required target files not modified: ${missing.join(", ")}. Changed files: ${changedFiles.join(", ") || "(none)"}`,
+    };
+  }
+  return null;
+}
+
+/**
+ * REJECT if story.noTestWrites is true but test files appear in the diff.
+ * Prevents Codex from writing aspirational tests that it can't fulfill.
+ */
+export function checkNoTestWrites(
+  diffStats: DiffStats,
+  noTestWrites?: boolean
+): VerificationCheck | null {
+  if (!noTestWrites) return null;
+
+  const testFiles = diffStats.files.filter(isTestFile);
+  if (testFiles.length > 0) {
+    return {
+      name: "banned_test_writes",
+      severity: "REJECT",
+      message: `Story has noTestWrites=true but test files were modified: ${testFiles.join(", ")}. Codex must implement, not write aspirational tests.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * REJECT if story.acceptanceAssertions specified but patterns not found
+ * in the target files' content on disk. Verifies the code was actually written.
+ */
+export function checkAcceptanceAssertions(
+  workdir: string,
+  targetFiles?: string[],
+  assertions?: string[]
+): VerificationCheck | null {
+  if (!assertions || assertions.length === 0) return null;
+  if (!targetFiles || targetFiles.length === 0) return null;
+
+  const missing: string[] = [];
+
+  for (const pattern of assertions) {
+    let found = false;
+    for (const target of targetFiles) {
+      try {
+        // Use grep to search for the pattern in files matching the target name
+        const result = execSync(
+          `grep -rl "${pattern.replace(/"/g, '\\"')}" --include="*${target}" . 2>/dev/null || true`,
+          { cwd: workdir, encoding: "utf-8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] }
+        ).trim();
+        if (result) { found = true; break; }
+      } catch { /* grep failure = not found */ }
+    }
+    if (!found) missing.push(pattern);
+  }
+
+  if (missing.length > 0) {
+    return {
+      name: "acceptance_assertions_missing",
+      severity: "REJECT",
+      message: `Acceptance assertions not found in target files: ${missing.map(m => `"${m}"`).join(", ")}`,
+    };
+  }
+  return null;
+}
+
 // ─── Main Entry ─────────────────────────────────────────────────────────────
 
 export function verifyOutput(input: VerificationInput): VerificationResult {
@@ -365,6 +461,10 @@ export function verifyOutput(input: VerificationInput): VerificationResult {
     checkSelfReportedFailure(codexResult.structuredResult),
     checkLazySummary(summary),
     checkHeavyExplorationNoWrites(codexResult.stderrStats),
+    // New guards: target files, test write ban, acceptance assertions
+    checkTargetFiles(diffStats, story.targetFiles),
+    checkNoTestWrites(diffStats, story.noTestWrites),
+    checkAcceptanceAssertions(workdir, story.targetFiles, story.acceptanceAssertions),
   ];
 
   for (const check of maybeChecks) {

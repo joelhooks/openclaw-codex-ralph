@@ -53,6 +53,15 @@ interface Story {
   acceptanceCriteria?: string[];
   issueNumber?: number;
   demoInstructions?: string;
+  /** Files that MUST appear in the git diff for the story to pass verification.
+   *  Partial matches allowed (e.g. "rpg-engine.ts" matches "apps/network/src/games/rpg-engine.ts"). */
+  targetFiles?: string[];
+  /** When true, any modification to test files (*.test.*, *.spec.*) causes verification REJECT.
+   *  Prevents Codex from writing aspirational tests it can't fulfill. */
+  noTestWrites?: boolean;
+  /** Grep patterns (plain strings) that must appear in targetFiles after completion.
+   *  E.g. ["BESTIARY", "Skeleton", "Goblin"] ensures the bestiary was actually populated. */
+  acceptanceAssertions?: string[];
 }
 
 interface PRD {
@@ -1145,6 +1154,24 @@ function buildIterationPrompt(prd: PRD, story: Story, progress: string, hivemind
     story.acceptanceCriteria.forEach((c, i) => parts.push(`${i + 1}. ${c}`));
   }
 
+  if (story.targetFiles?.length) {
+    parts.push(`\n### Required Target Files`);
+    parts.push(`You MUST modify these files (verification will REJECT if they are not in the diff):`);
+    story.targetFiles.forEach((f) => parts.push(`- ${f}`));
+  }
+
+  if (story.noTestWrites) {
+    parts.push(`\n### ⚠️ DO NOT WRITE OR MODIFY TEST FILES`);
+    parts.push(`This story has noTestWrites=true. Any changes to *.test.* or *.spec.* files will cause automatic REJECTION.`);
+    parts.push(`Implement the feature in the source files only. Existing tests must continue to pass as-is.`);
+  }
+
+  if (story.acceptanceAssertions?.length) {
+    parts.push(`\n### Acceptance Assertions`);
+    parts.push(`These strings MUST appear in the target files after your changes (grep verification):`);
+    story.acceptanceAssertions.forEach((a) => parts.push(`- "${a}"`));
+  }
+
   if (story.validationCommand) {
     parts.push(`\n### Validation`);
     parts.push(`Run: \`${story.validationCommand}\``);
@@ -1618,6 +1645,9 @@ async function executeRalphAddStory(params: {
   validationCommand?: string;
   acceptanceCriteria?: string;
   demoInstructions?: string;
+  targetFiles?: string;
+  noTestWrites?: boolean;
+  acceptanceAssertions?: string;
 }, cfg: PluginConfig) {
   const prd = readPRD(params.workdir);
   if (!prd) {
@@ -1644,6 +1674,20 @@ async function executeRalphAddStory(params: {
 
   if (params.demoInstructions) {
     story.demoInstructions = params.demoInstructions;
+  }
+
+  if (params.targetFiles) {
+    try { story.targetFiles = JSON.parse(params.targetFiles); }
+    catch { story.targetFiles = [params.targetFiles]; }
+  }
+
+  if (params.noTestWrites) {
+    story.noTestWrites = true;
+  }
+
+  if (params.acceptanceAssertions) {
+    try { story.acceptanceAssertions = JSON.parse(params.acceptanceAssertions); }
+    catch { story.acceptanceAssertions = [params.acceptanceAssertions]; }
   }
 
   // Create GH issue for the story if ghIssues enabled
@@ -1703,6 +1747,9 @@ async function executeRalphEditStory(params: {
   passes?: boolean;
   validationCommand?: string;
   demoInstructions?: string;
+  targetFiles?: string;
+  noTestWrites?: boolean;
+  acceptanceAssertions?: string;
 }) {
   const prd = readPRD(params.workdir);
   if (!prd) {
@@ -1720,6 +1767,15 @@ async function executeRalphEditStory(params: {
   if (params.passes !== undefined) story.passes = params.passes;
   if (params.validationCommand !== undefined) story.validationCommand = params.validationCommand;
   if (params.demoInstructions !== undefined) story.demoInstructions = params.demoInstructions;
+  if (params.targetFiles !== undefined) {
+    try { story.targetFiles = JSON.parse(params.targetFiles); }
+    catch { story.targetFiles = [params.targetFiles]; }
+  }
+  if (params.noTestWrites !== undefined) story.noTestWrites = params.noTestWrites;
+  if (params.acceptanceAssertions !== undefined) {
+    try { story.acceptanceAssertions = JSON.parse(params.acceptanceAssertions); }
+    catch { story.acceptanceAssertions = [params.acceptanceAssertions]; }
+  }
 
   writePRD(params.workdir, prd);
 
@@ -2635,6 +2691,9 @@ const ralphCodexPlugin = {
           validationCommand: { type: "string", description: "Command to validate the story (e.g., 'npm test')" },
           acceptanceCriteria: { type: "string", description: "Acceptance criteria as JSON array of strings" },
           demoInstructions: { type: "string", description: "Instructions for showboat demo phase (triggers demo when showboat is enabled)" },
+          targetFiles: { type: "string", description: "JSON array of filenames that MUST appear in the git diff (partial match). REJECT if missing." },
+          noTestWrites: { type: "boolean", description: "When true, any test file modification causes REJECT. Prevents aspirational tests." },
+          acceptanceAssertions: { type: "string", description: "JSON array of strings that must appear in targetFiles content after completion." },
         },
         required: ["workdir", "title", "description"],
         additionalProperties: false,
@@ -2680,6 +2739,9 @@ const ralphCodexPlugin = {
           passes: { type: "boolean", description: "Mark as passed/failed" },
           validationCommand: { type: "string", description: "New validation command" },
           demoInstructions: { type: "string", description: "Instructions for showboat demo phase" },
+          targetFiles: { type: "string", description: "JSON array of filenames that MUST appear in the git diff" },
+          noTestWrites: { type: "boolean", description: "When true, test file modifications cause REJECT" },
+          acceptanceAssertions: { type: "string", description: "JSON array of strings that must appear in target files" },
         },
         required: ["workdir", "storyId"],
         additionalProperties: false,
